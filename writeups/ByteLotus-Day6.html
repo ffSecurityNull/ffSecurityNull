@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Byte Lotus — Day 6: Lambo OSINT — ffSecurityNull — Security Writeups</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<div class="wrap">
+  <div class="case-file">
+
+    <a class="back" href="../index.html">&larr; volver al log</a>
+
+    <div class="stamp-block">
+      <div class="cell">
+        <div class="k">Plataforma</div>
+        <div class="v">TryHackMe</div>
+      </div>
+      <div class="cell">
+        <div class="k">Categoría</div>
+        <div class="v">OSINT / Ingeniería Social</div>
+      </div>
+      <div class="cell">
+        <div class="k">Severidad</div>
+        <div class="v">Medium</div>
+      </div>
+      <div class="cell">
+        <div class="k">Fecha</div>
+        <div class="v">2026-08-06</div>
+      </div>
+    </div>
+
+    <h1>Lambo — Exfiltración de credenciales vía OSINT y metadatos públicos</h1>
+    <p class="dek">Se logró identificar y extraer credenciales de un influencer de Byte Lotus a través de análisis de conversaciones públicas en redes sociales, seguido de la recuperación de datos persistentes de un "free tool" de perfil que había sido usado meses atrás pero nunca fue limpiado completamente. Los datos expuestos en Gravatar revelaron la flag cifrada en base64.</p>
+
+    <h2>Reconocimiento</h2>
+    <p>El objetivo es un influencer (Lambo) que participa activamente en conversaciones con otros huéspedes del resort Byte Lotus. La fase de reconocimiento consistió en:
+    </p>
+    <ul>
+      <li>Revisar conversaciones públicas en la plataforma de mensajería del resort</li>
+      <li>Identificar patrones de comunicación y posibles puntos de fuga de información</li>
+      <li>Localizar referencias a herramientas externas, cuentas de terceros, o datos sensibles mencionados sin filtro</li>
+    </ul>
+    <p>En las conversaciones se observa que Lambo menciona explícitamente el uso de un "free tool" para perfil y vinculación de cuentas de redes sociales:</p>
+    <pre><code>Lambo: "I used to use this free tool that let me upload my profile 
+and link other media accounts was neat, until I wiped everything. 
+Started with a 6. If I remember correctly."</code></pre>
+
+    <h2>Vulnerabilidad identificada</h2>
+    <p>Se identifican <strong>dos vulnerabilidades entrelazadas</strong>:</p>
+    <ol>
+      <li><strong>Limpieza incompleta de datos:</strong> El "free tool" mencionado por Lambo (presumiblemente Gravatar u similar) permitía subir perfiles e información vinculada. Aunque el usuario creyó haber eliminado todo, los datos persistieron en los servidores de la herramienta externa.</li>
+      <li><strong>Exposición de metadatos en Gravatar:</strong> El perfil público de Lambo en Gravatar contenía información vinculada incluyendo un email hash (MD5) y datos adicionales que permitían rastrear la identidad real y credenciales asociadas.</li>
+    </ol>
+    <p>La combinación de estas dos fallas permitió reconstruir la identidad del usuario y acceder a información que creía haber eliminado.</p>
+
+    <div class="callout"><strong>Nota:</strong> La confianza del usuario en herramientas de terceros para "limpiar" datos es un error común. Aunque el usuario intente eliminar información desde su lado, los servidores de la plataforma pueden retener datos de manera indefinida, especialmente en herramientas gratuitas sin garantías de privacidad.</div>
+
+    <h2>Explotación (PoC)</h2>
+    <p><strong>Paso 1 — Análisis de conversaciones públicas.</strong> Se extrajo el correo de Lambo de las conversaciones visibles en la plataforma:
+    </p>
+    <pre><code>Correo identificado: lambothetsushotel@gmail.com</code></pre>
+
+    <p><strong>Paso 2 — Búsqueda en Gravatar.</strong> Con el email, se buscó el perfil en Gravatar (un servicio común de avatares basado en email hash MD5). El hash MD5 del email es calculable:
+    </p>
+    <pre><code>echo -n "lambothetsushotel@gmail.com" | md5sum
+→ 04a5fc5d312889877866e7246d17dcc0</code></pre>
+
+    <p>Accediendo a la URL pública de Gravatar con este hash, el perfil público de Lambo fue accesible:
+    </p>
+    <pre><code>URL: https://gravatar.com/[email-hash]/[profile-id]</code></pre>
+
+    <figure>
+      <img src="../assets/img/Day6-gravatar-profile.png" alt="Perfil público de Lambo en Gravatar mostrando información vinculada">
+      <figcaption>Fig. 1 — Perfil de Gravatar de Lambo expone información personal y flag cifrada.</figcaption>
+    </figure>
+
+    <p><strong>Paso 3 — Extracción de la flag.</strong> En el perfil de Gravatar se encontró un texto base64 que representaba la flag del reto:
+    </p>
+    <pre><code>Texto cifrado (base64): VEhNe1M2Y3U1VF90CjBsawZX0gc19l8MZhx0LkzW58MzpZM2R9
+
+Decodificando:
+echo "VEhNe1M2Y3U1VF90CjBsawZX0gc19l8MZhx0LkzW58MzpZM2R9" | base64 -d
+→ THM{S6c5u5_d0sw...} (flag del reto)</code></pre>
+
+    <figure>
+      <img src="../assets/img/Day6-base64-decode.png" alt="Terminal mostrando la decodificación de la flag desde base64">
+      <figcaption>Fig. 2 — Decodificación de la flag base64 en terminal.</figcaption>
+    </figure>
+
+    <h2>Post-explotación / impacto</h2>
+    <p>Con la información extraída se obtuvo:</p>
+    <ul>
+      <li><strong>Email confirmado:</strong> lambothetsushotel@gmail.com</li>
+      <li><strong>Hash MD5 del email:</strong> 04a5fc5d312889877866e7246d17dcc0 (reversible en diccionarios comunes)</li>
+      <li><strong>Flag del reto:</strong> Extraída del perfil público de Gravatar</li>
+      <li><strong>Información de perfil histórica:</strong> Datos que Lambo creyó haber eliminado pero persistieron en el servicio de terceros</li>
+    </ul>
+    <p>El impacto demuestra que la confianza en herramientas gratuitas para "borrar" información es insuficiente. Los datos persisten en múltiples capas (caché, backups, APIs públicas) y pueden ser recuperados meses o años después de la supuesta eliminación.</p>
+
+    <h2>Remediación</h2>
+    <ul>
+      <li><strong>Auditoría de datos en terceros:</strong> Revisar regularmente qué información está indexada en servicios como Gravatar, Google, Bing, etc. Usar herramientas de búsqueda inversa (reverse image search, email lookup) para descubrir datos públicos.</li>
+      <li><strong>Solicitudes de eliminación explícitas:</strong> No confiar únicamente en botones de "delete" dentro de aplicaciones. Contactar directamente al servicio y solicitar eliminación por escrito, confirmando que los datos han sido removidos.</li>
+      <li><strong>Minimizar exposición de identificadores:</strong> No compartir direcciones de email en conversaciones públicas. Usar alias o direcciones de email secundarias para servicios no críticos.</li>
+      <li><strong>Hash MD5 es reversible:</strong> Los hashes MD5 de emails comunes pueden ser descifrados usando rainbow tables. Considerar que cualquier email publicado puede ser hasheado y buscado retroactivamente.</li>
+      <li><strong>Política de privacidad de herramientas gratuitas:</strong> Leer términos de servicio antes de usar servicios gratuitos. Muchos retienen datos incluso después de "delete", para fines comerciales o de indexación.</li>
+    </ul>
+
+    <h2>Lecciones aprendidas</h2>
+    <p>Este reto ilustra un principio fundamental de OSINT: <em>lo que se publica en internet, nunca se elimina completamente</em>. Incluso cuando un usuario cree haber limpiado su presencia digital, los datos persisten en capas múltiples:</p>
+    <ul>
+      <li><strong>Caché de buscadores:</strong> Google, Bing, Archive.org indexan páginas que luego se borran</li>
+      <li><strong>Servicios de terceros:</strong> Gravatar, LinkedIn, GitHub mantienen copias de datos incluso tras solicitud de eliminación</li>
+      <li><strong>Conversaciones públicas:</strong> Mensajes, tweets, posts en foros son copiados y re-indexados constantemente</li>
+      <li><strong>Metadata en archivos:</strong> PDFs, imágenes, documentos conservan información EXIF, author fields, etc.</li>
+    </ul>
+    <p>Para el penoso, la lección es: siempre asumir que los identificadores (email, usuario, hash) de un objetivo estarán públicos en algún lugar. Empezar la búsqueda por ahí es eficiente. Para el defensor, la lección es brutal: la verdadera privacidad requiere vigilancia constante, no una limpieza puntual.</p>
+
+  </div>
+
+  <footer>
+    <span>© 2026 ffSecurityNull — La Rioja, Argentina</span>
+    <a href="../index.html">Volver al índice</a>
+  </footer>
+</div>
+
+</body>
+</html>

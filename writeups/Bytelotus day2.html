@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>The Byte Lotus – Day 2 — ffSecurityNull — Security Writeups</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<div class="wrap">
+  <div class="case-file">
+
+    <a class="back" href="../index.html">&larr; volver al log</a>
+
+    <div class="stamp-block">
+      <div class="cell">
+        <div class="k">Plataforma</div>
+        <div class="v">TryHackMe</div>
+      </div>
+      <div class="cell">
+        <div class="k">Categoría</div>
+        <div class="v">Web / Directory Enumeration</div>
+      </div>
+      <div class="cell">
+        <div class="k">Severidad</div>
+        <div class="v">Critic</div>
+      </div>
+      <div class="cell">
+        <div class="k">Fecha</div>
+        <div class="v">2026-08-02</div>
+      </div>
+    </div>
+
+    <h1>Room 404 — Exposición de repositorio Git en servidor web</h1>
+    <p class="dek">Se descubrió un directorio <code>.git</code> expuesto públicamente en el servidor web del resort "The Byte Lotus". Mediante enumeración de directorios y posterior volcado del repositorio, se obtuvo el código fuente completo de la plataforma y una flag de staging contenida en el README.</p>
+
+    <h2>Reconocimiento</h2>
+    <p>El objetivo era una máquina accesible en el puerto 8080, que alojaba la plataforma de experiencia del huésped del Byte Lotus. Se realizó un escaneo de puertos con nmap para identificar servicios activos:</p>
+    <pre><code>mkdir nmap
+nmap -sC -sV -oN nmap/initial 10.64.148.203</code></pre>
+    <p>El escaneo reveló dos puertos abiertos:</p>
+    <ul>
+      <li><strong>22/tcp</strong> — OpenSSH 9.6p1 Ubuntu 3ubuntu13.16</li>
+      <li><strong>8080/tcp</strong> — HTTP proxy Werkzeug/3.0.1 Python/3.12.3</li>
+    </ul>
+    <p>El resultado más significativo fue que nmap detectó automáticamente un repositorio Git expuesto en <code>10.64.148.203:8080/.git/</code>, con el mensaje de último commit: <em>"initial Byte Lotus guest platform"</em>.</p>
+
+    <figure>
+      <img src="../assets/img/day2-nmap-scan.png" alt="Resultado del escaneo nmap mostrando puertos abiertos y repositorio Git detectado">
+      <figcaption>Fig. 1 — Escaneo nmap revela puertos abiertos y un repositorio Git expuesto en el puerto 8080.</figcaption>
+    </figure>
+
+    <h2>Vulnerabilidad identificada</h2>
+    <p>El servidor web exponía públicamente el directorio <code>.git</code> del proyecto. Esto significa que cualquier usuario podía acceder a la estructura interna del repositorio — incluyendo el historial de commits, el código fuente completo y archivos de configuración — sin ningún tipo de autenticación o restricción de acceso.</p>
+    <p>Esta es una mala práctica común en despliegues web donde se copia el directorio del proyecto (incluyendo <code>.git</code>) directamente al servidor de producción sin excluir los archivos de control de versiones.</p>
+
+    <div class="callout"><strong>Nota:</strong> El propio nmap identificó el repositorio Git gracias a sus scripts de detección por defecto (<code>-sC</code>). Esto demuestra que la exposición era trivialmente detectable con herramientas estándar de reconocimiento.</div>
+
+    <h2>Explotación (PoC)</h2>
+    <p><strong>Paso 1 — Enumeración de directorios.</strong> Se utilizó feroxbuster para confirmar la estructura expuesta y buscar rutas adicionales:</p>
+    <pre><code>feroxbuster -u http://10.64.148.203:8080 -w /usr/share/wordlists/SecLists/Discovery/Web-Content/common.txt</code></pre>
+    <p>Feroxbuster confirmó respuestas 200 en <code>/.git/HEAD</code> y en la raíz del sitio, validando que el repositorio Git era accesible públicamente.</p>
+
+    <figure>
+      <img src="../assets/img/day2-feroxbuster.png" alt="Resultado de feroxbuster mostrando .git/HEAD accesible">
+      <figcaption>Fig. 2 — Feroxbuster confirma que el directorio .git está expuesto con código de estado 200.</figcaption>
+    </figure>
+
+    <p><strong>Paso 2 — Volcado del repositorio Git.</strong> Con la confirmación de que <code>.git</code> era accesible, se procedió a volcar el repositorio completo localmente utilizando herramientas de git dumping:</p>
+    <pre><code># Volcado del repositorio y checkout de los archivos
+ls -la loot
+# Contenido: .git/  README.md  app.js  index.html</code></pre>
+
+    <p><strong>Paso 3 — Extracción de la flag.</strong> Al examinar el contenido del repositorio volcado, se encontró la flag directamente en el archivo <code>README.md</code>:</p>
+    <pre><code>cat loot/README.md
+# Byte Lotus — Guest Experience Platform
+#
+# Internal staging repository for the guest app and concierge personalization
+# service. Do not deploy this folder to production.
+#
+# Staging flag (remove before launch): THM{byt3_l0tus_n3v3r_f0rg3ts}</code></pre>
+
+    <figure>
+      <img src="../assets/img/day2-git-dump-flag.png" alt="Contenido del repositorio volcado y flag encontrada en README.md">
+      <figcaption>Fig. 3 — Repositorio volcado exitosamente. El README.md contiene la flag de staging.</figcaption>
+    </figure>
+
+    <h2>Post-explotación / impacto</h2>
+    <p>Con el volcado completo del repositorio se obtuvo:</p>
+    <ul>
+      <li>El <strong>código fuente completo</strong> de la plataforma de experiencia del huésped (<code>app.js</code>, <code>index.html</code>).</li>
+      <li>La <strong>flag de staging</strong> olvidada en el README, que nunca fue removida antes del despliegue.</li>
+      <li>El <strong>historial completo de commits</strong>, que podría contener credenciales, tokens o configuraciones previas.</li>
+    </ul>
+    <p>El impacto va más allá de la flag: un atacante con acceso al código fuente puede identificar vulnerabilidades adicionales en la lógica de la aplicación, endpoints ocultos, y potencialmente credenciales hardcodeadas en el historial de Git.</p>
+
+    <h2>Remediación</h2>
+    <ul>
+      <li><strong>Excluir <code>.git</code> del despliegue:</strong> nunca copiar el directorio <code>.git</code> al servidor de producción. Usar <code>git archive</code> o pipelines de CI/CD que exporten solo los archivos necesarios.</li>
+      <li><strong>Bloquear acceso a dotfiles en el servidor web:</strong> configurar reglas en el servidor (nginx, Apache, etc.) que denieguen el acceso a cualquier ruta que comience con un punto (<code>.*</code>).</li>
+      <li><strong>Eliminar datos sensibles del repositorio:</strong> las flags, credenciales y tokens no deben existir en el código fuente ni en el historial de commits. Usar variables de entorno o gestores de secretos.</li>
+      <li><strong>Auditar el historial de Git:</strong> utilizar herramientas como <code>git-secrets</code> o <code>trufflehog</code> para detectar secretos en el historial antes de desplegar.</li>
+    </ul>
+
+    <h2>Lecciones aprendidas</h2>
+    <p>Este ejercicio demuestra una vulnerabilidad clásica pero persistente en entornos web: la exposición de archivos de control de versiones. El hecho de que nmap la detecte con sus scripts por defecto subraya lo trivial que es encontrarla — y sin embargo sigue apareciendo en entornos reales.</p>
+    <p>La lección principal es sobre higiene de despliegue: el servidor de producción no es el servidor de desarrollo. Todo lo que no sea estrictamente necesario para servir la aplicación — incluyendo <code>.git</code>, <code>README.md</code>, archivos de configuración de desarrollo — debe ser excluido del deploy. La frase del propio README lo dice todo: <em>"Do not deploy this folder to production"</em>, y sin embargo, ahí estaba.</p>
+
+  </div>
+
+  <footer>
+    <span>© 2026 ffSecurityNull — La Rioja, Argentina</span>
+    <a href="../index.html">Volver al índice</a>
+  </footer>
+</div>
+
+</body>
+</html>

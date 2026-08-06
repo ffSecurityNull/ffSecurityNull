@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>The Byte Lotus – Day 8 — ffSecurityNull — Security Writeups</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<div class="wrap">
+  <div class="case-file">
+
+    <a class="back" href="../index.html">&larr; volver al log</a>
+
+    <div class="stamp-block">
+      <div class="cell">
+        <div class="k">Plataforma</div>
+        <div class="v">TryHackMe</div>
+      </div>
+      <div class="cell">
+        <div class="k">Categoría</div>
+        <div class="v">Web / Business Logic / Race Condition</div>
+      </div>
+      <div class="cell">
+        <div class="k">Severidad</div>
+        <div class="v">Medium</div>
+      </div>
+      <div class="cell">
+        <div class="k">Fecha</div>
+        <div class="v">2026-08-06</div>
+      </div>
+    </div>
+
+    <h1>Towel on the Sunbed — Race Condition (TOCTOU) en claim de staking rewards</h1>
+    <p class="dek">Se explotó una condición de carrera en el endpoint de reclamo de recompensas de "Ponzi Portfolio", un panel de staking del resort. Al disparar peticiones concurrentes contra un cooldown de 24hs validado de forma no atómica, se logró reclamar la recompensa múltiples veces en una sola ráfaga, alcanzando el tier "Whale" y accediendo a la flag del Whale Vault.</p>
+
+    <h2>Reconocimiento</h2>
+    <p>El objetivo era "Ponzi Portfolio", un panel de staking rewards donde el usuario puede reclamar 50 PONZI cada 24 horas. La meta del reto era alcanzar 150 PONZI de balance para desbloquear el tier "Whale" y acceder a un "Whale Vault" que contenía la flag. El briefing del reto ya insinuaba el vector: el cooldown de 24hs tenía <em>"un gap wide enough to walk a whale through"</em>, y una publicación in-game de otro jugador remarcaba que el timer no era el único mecanismo que frenaba los claims — apuntando a una condición de carrera antes que a manipulación de timestamps.</p>
+
+    <figure>
+      <img src="../assets/img/Day8-briefing.png" alt="Briefing del reto Towel on the Sunbed mostrando puntos, categoría, dificultad y objetivos del itinerario">
+      <figcaption>Fig. 1 — Briefing del reto: acceso al lab y objetivos del itinerario.</figcaption>
+    </figure>
+
+    <figure>
+      <img src="../assets/img/Day8-story-hint.png" alt="Publicación in-game de otro jugador insinuando que el timer no es el único control">
+      <figcaption>Fig. 2 — Pista: el reloj/timer no es el único mecanismo de protección.</figcaption>
+    </figure>
+
+    <p>Tras registrar una cuenta e iniciar sesión, se identificó el botón "Claim Reward" en el dashboard. Interceptando la petición con Burp Suite se observó que el endpoint <code>POST /claim</code> no requiere body — toda la validación de estado (último claim, balance, tier) se maneja server-side a través de la cookie de sesión <code>connect.sid</code>.</p>
+
+    <figure>
+      <img src="../assets/img/Day8-first-claim.png" alt="Primer claim exitoso con respuesta 200 OK mostrando balance, reward y tier actualizados">
+      <figcaption>Fig. 3 — Primer claim exitoso: respuesta 200 OK con balance, reward y tier actualizados.</figcaption>
+    </figure>
+
+    <p>Al intentar reclamar una segunda vez inmediatamente, el servidor respondió con <code>429 Too Many Requests</code>, incluyendo el campo <code>secondsRemaining</code> con el tiempo exacto restante del cooldown (~24hs). Esto confirmó que la validación del cooldown ocurre en el servidor, pero el nivel de detalle expuesto en el error sugería un cálculo del tipo "ahora − últimoClaim" que podía no ser atómico.</p>
+
+    <figure>
+      <img src="../assets/img/Day8-429-cooldown.png" alt="Respuesta 429 Too Many Requests confirmando cooldown activo de 24 horas">
+      <figcaption>Fig. 4 — Respuesta 429 confirmando cooldown activo de 24hs vía secondsRemaining.</figcaption>
+    </figure>
+
+    <h2>Vulnerabilidad identificada</h2>
+    <p>El endpoint <code>POST /claim</code> implementaba el cooldown como una operación de tipo <strong>check-then-act</strong> (lectura de estado seguida de escritura) en dos pasos separados, sin bloqueo atómico a nivel de base de datos ni de fila. Bajo concurrencia, múltiples hilos de ejecución podían leer el mismo estado "no reclamado aún" antes de que cualquiera de ellos escribiera el nuevo timestamp de <code>last_claim</code>, permitiendo que varias peticiones pasaran la validación del cooldown dentro de la misma ventana de milisegundos.</p>
+
+    <div class="callout"><strong>Nota:</strong> Esta clase de vulnerabilidad se conoce como <strong>TOCTOU</strong> (Time-Of-Check to Time-Of-Use). No es un fallo de autenticación ni de exposición de datos, sino un fallo de <em>business logic</em>: la aplicación confía en que las peticiones llegan de forma secuencial, algo que no está garantizado en un entorno concurrente real.</div>
+
+    <h2>Explotación (PoC)</h2>
+    <p><strong>Paso 1 — Hipótesis de trabajo.</strong> Si el servidor valida el cooldown (lectura) y luego persiste el nuevo estado (escritura) en dos pasos separados, enviar múltiples peticiones <code>POST /claim</code> en paralelo dentro de esa ventana podría hacer que varias pasen la validación antes de que la primera termine de escribir.</p>
+
+    <p><strong>Paso 2 — Configuración del ataque.</strong> Se utilizó una cuenta nueva (claim virgen) y se envió el request a la extensión <strong>Turbo Intruder</strong> de Burp Suite, con un script para disparar 15 conexiones concurrentes hacia el mismo endpoint:</p>
+    <pre><code>def queueRequests(target, wordlists):
+    engine = RequestEngine(endpoint=target.endpoint,
+                            concurrentConnections=15,
+                            requestsPerConnection=1,
+                            pipeline=False)
+    for i in range(15):
+        engine.queue(target.req)
+
+def handleResponse(req, interesting):
+    table.add(req)</code></pre>
+
+    <figure>
+      <img src="../assets/img/Day8-turbo-intruder-setup.png" alt="Configuración de Turbo Intruder con request Content-Length 0 y script de concurrencia">
+      <figcaption>Fig. 5 — Configuración final del ataque: request con Content-Length: 0 y script de concurrencia.</figcaption>
+    </figure>
+
+    <p><strong>Paso 3 — Disparo de las 15 peticiones concurrentes.</strong> Múltiples peticiones fueron procesadas como <code>200 OK</code> con el mensaje <em>"Staking reward claimed successfully"</em> antes de que el servidor empezara a rechazar las siguientes con <code>429</code>, confirmando la condición de carrera.</p>
+
+    <figure>
+      <img src="../assets/img/Day8-turbo-intruder-results.png" alt="Resultados de Turbo Intruder mostrando múltiples respuestas 200 OK concurrentes">
+      <figcaption>Fig. 6 — Resultados en Turbo Intruder: respuestas 200 OK concurrentes, balance final 750 PONZI y tier "Whale".</figcaption>
+    </figure>
+
+    <h2>Post-explotación / impacto</h2>
+    <p>De las 15 peticiones simultáneas, un subconjunto fue aceptado antes de que el servidor cerrara la ventana de carrera. El balance saltó de 0 a <strong>750 PONZI</strong> en una sola ráfaga (equivalente a 15 claims de 50 cada uno), superando ampliamente el umbral de 150 necesario para el tier "Whale".</p>
+    <p>Con el tier "Whale" desbloqueado, el dashboard mostró la sección "Whale Vault" con el botón "Open Vault" habilitado. Al reclamarlo, la aplicación reveló la flag directamente en el panel:</p>
+
+    <figure>
+      <img src="../assets/img/Day8-whale-vault-flag.png" alt="Dashboard con Whale Vault desbloqueado mostrando balance de 750 sobre 150 PONZI y la flag capturada">
+      <figcaption>Fig. 7 — Dashboard con Whale Vault desbloqueado (750/150 PONZI) y flag capturada.</figcaption>
+    </figure>
+
+    <pre><code>THM{t0w3l_0n_th3_sunb3d_d0ubl3_sp3nt}</code></pre>
+
+    <p>El impacto está acotado a la lógica de negocio de la propia cuenta del atacante: no se accedió a datos de otros usuarios ni se comprometió el sistema subyacente. Sin embargo, en un entorno real con valor económico real (tokens, puntos canjeables, límites de uso), este tipo de bypass permitiría inflar balances, saltarse límites de tasa, o abusar de mecanismos de recompensa de forma sistemática.</p>
+
+    <h2>Remediación</h2>
+    <ul>
+      <li><strong>Operación atómica a nivel de base de datos:</strong> combinar la validación del cooldown y la actualización del timestamp en una sola transacción, por ejemplo <code>UPDATE ... WHERE last_claim &lt; NOW() - INTERVAL 24 HOUR</code>, de forma que solo una petición pueda ganar la carrera.</li>
+      <li><strong>Lock distribuido o de fila:</strong> aplicar un row-level lock sobre el registro del usuario durante el proceso de claim para serializar el acceso concurrente.</li>
+      <li><strong>Rate limiting a nivel de infraestructura:</strong> agregar una capa adicional de defensa (API gateway, WAF, middleware) que limite la tasa de peticiones por sesión/IP como control complementario al de aplicación.</li>
+      <li><strong>Idempotencia en operaciones críticas:</strong> diseñar endpoints sensibles a duplicación (claims, pagos, canjes) para que una petición repetida no tenga efecto adicional una vez procesada la primera.</li>
+    </ul>
+
+    <h2>Lecciones aprendidas</h2>
+    <p>Este reto es un buen recordatorio de que un rate-limit visible y funcional (el <code>429</code> con <code>secondsRemaining</code>) no garantiza que la lógica subyacente sea segura bajo concurrencia. El error se sentía "correcto" en pruebas secuenciales, pero un simple check-then-act sin atomicidad se rompe apenas se envían varias peticiones en paralelo.</p>
+    <p>También refuerza el valor de las pistas narrativas del reto: tanto el briefing como la publicación in-game apuntaban directamente al vector — el timer no es lo único que protege el endpoint. Detectar ese tipo de indicios y traducirlos en una hipótesis técnica concreta (race condition vs. manipulación de timestamp) fue la parte clave del reconocimiento.</p>
+    <p>Desde el punto de vista de herramientas, Turbo Intruder demostró ser la elección correcta sobre Intruder estándar: permite controlar con precisión el número de conexiones concurrentes y el timing de disparo, algo esencial para explotar ventanas de carrera de milisegundos de forma confiable.</p>
+
+  </div>
+
+  <footer>
+    <span>© 2026 ffSecurityNull — La Rioja, Argentina</span>
+    <a href="../index.html">Volver al índice</a>
+  </footer>
+</div>
+
+</body>
+</html>

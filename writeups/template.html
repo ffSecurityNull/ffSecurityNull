@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>[Título del caso] — ffSecurityNull — Security Writeups</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<div class="wrap">
+  <div class="case-file">
+
+    <a class="back" href="../index.html">&larr; volver al log</a>
+
+    <div class="stamp-block">
+      <div class="cell">
+        <div class="k">Plataforma</div>
+        <div class="v"><!-- TryHackMe / HTB / propio --></div>
+      </div>
+      <div class="cell">
+        <div class="k">Categoría</div>
+        <div class="v"><!-- Web / AD / Priv Esc / etc --></div>
+      </div>
+      <div class="cell">
+        <div class="k">Severidad</div>
+        <div class="v"><!-- Critical / High / Medium / Low --></div>
+      </div>
+      <div class="cell">
+        <div class="k">Fecha</div>
+        <div class="v"><!-- YYYY-MM-DD --></div>
+      </div>
+    </div>
+
+    <h1>[Nombre del reto / vulnerabilidad]</h1>
+    <p class="dek">Una o dos líneas resumiendo qué se explotó y el impacto final, en lenguaje simple.</p>
+
+    <h2>Reconocimiento</h2>
+    <p>Qué escaneos / enumeración inicial se hizo y qué se encontró.</p>
+    <pre><code>nmap -sC -sV -oN scan.txt 10.10.10.10</code></pre>
+
+    <h2>Vulnerabilidad identificada</h2>
+    <p>Explicación de la falla encontrada y por qué es explotable.</p>
+
+    <div class="callout"><strong>Nota:</strong> comentario adicional, hipótesis descartadas, o contexto relevante.</div>
+
+    <h2>Explotación (PoC)</h2>
+    <p>Pasos concretos para explotar la vulnerabilidad, con comandos y payloads.</p>
+    <pre><code>curl -X POST http://target/login -d "user=admin&pass=' OR '1'='1'--"</code></pre>
+
+    <figure>
+      <img src="../assets/img/PLACEHOLDER.png" alt="Descripción de la captura">
+      <figcaption>Fig. 1 — Descripción de qué muestra la captura.</figcaption>
+    </figure>
+
+    <h2>Post-explotación / impacto</h2>
+    <p>Qué se logró tras la explotación (acceso, escalada, datos expuestos, etc.).</p>
+
+    <h2>Remediación</h2>
+    <ul>
+      <li>Recomendación concreta 1</li>
+      <li>Recomendación concreta 2</li>
+    </ul>
+
+    <h2>Lecciones aprendidas</h2>
+    <p>Qué aprendiste técnicamente o de metodología en este ejercicio.</p>
+
+  </div>
+
+  <footer>
+    <span>© 2026 ffSecurityNull — La Rioja, Argentina</span>
+    <a href="../index.html">Volver al índice</a>
+  </footer>
+</div>
+
+</body>
+</html>

